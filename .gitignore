@@ -1,0 +1,53 @@
+# dependencies
+node_modules/
+
+# build outputs
+dist/
+.vite/
+dist-server/
+
+# repo docs / archives (excluded)
+/docs/
+/legacy/
+
+# project root markdown files (excluded)
+/AGENTS.md
+/DOCS_INDEX.md
+/README.md
+
+# coverage / reports
+coverage/
+.nyc_output/
+
+# logs
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# env files (never commit secrets)
+.env*
+!.env.example
+.env.*.local
+data/
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# caches
+*.tsbuildinfo
+.eslintcache
+.stylelintcache
+vite.config.*.timestamp-*
+
+# Playwright
+playwright-report/
+test-results/

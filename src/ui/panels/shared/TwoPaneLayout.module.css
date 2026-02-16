@@ -1,0 +1,23 @@
+.root {
+  height: 100%;
+  width: 100%;
+  display: grid;
+  grid-template-columns: 340px 1fr;
+  min-width: 0;
+}
+
+.list {
+  min-width: 0;
+  border-right: 1px solid var(--border);
+  background: var(--bg-panel);
+  display: flex;
+  flex-direction: column;
+}
+
+.content {
+  min-width: 0;
+  background: var(--bg-app);
+  display: flex;
+  flex-direction: column;
+}
+

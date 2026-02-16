@@ -1,0 +1,21 @@
+.empty {
+  height: 100%;
+  padding: 48px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: var(--space-2);
+  color: var(--text-secondary);
+}
+
+.emptyTitle {
+  font-weight: 700;
+  font-size: 18px;
+  color: var(--text-primary);
+}
+
+.emptyDesc {
+  max-width: 520px;
+  line-height: 1.6;
+}
+

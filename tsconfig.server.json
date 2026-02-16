@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "outDir": "dist-server",
+    "types": ["node"],
+    "resolveJsonModule": true
+  },
+  "include": ["src/server/**/*.ts"],
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx", "node_modules", "legacy"]
+}

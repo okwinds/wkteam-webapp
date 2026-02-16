@@ -1,0 +1,10 @@
+.root {
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #0b0b0b;
+  font-weight: 700;
+  user-select: none;
+}
+

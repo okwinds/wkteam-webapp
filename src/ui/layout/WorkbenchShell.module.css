@@ -1,0 +1,21 @@
+.root {
+  height: 100vh;
+  width: 100vw;
+  display: grid;
+  grid-template-columns: 72px 1fr;
+  background: var(--bg-app);
+  color: var(--text-primary);
+  overflow: hidden;
+}
+
+.rail {
+  border-right: 1px solid var(--border);
+  background: var(--bg-rail);
+}
+
+.main {
+  height: 100%;
+  display: flex;
+  min-width: 0;
+}
+
