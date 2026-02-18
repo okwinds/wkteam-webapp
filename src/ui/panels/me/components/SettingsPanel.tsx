@@ -106,6 +106,18 @@ export function SettingsPanel() {
             </div>
 
             <div className={styles.row}>
+              <div className={styles.label}>wId（上游参数）</div>
+              <input
+                className={styles.input}
+                value={connection.settings.wkteamWId}
+                aria-label="上游 wId 参数"
+                placeholder="例如：23456789012（可选，用于 SDK 自动填充）"
+                onChange={(e) => connectionActions.setWkteamWId(e.target.value)}
+              />
+            </div>
+            <div className={styles.hint}>提示：这是上游接口参数（不是鉴权 token），保存后在 SDK 控制台调用含 wId 参数的接口时会自动填入。</div>
+
+            <div className={styles.row}>
               <div className={styles.label}>token</div>
               <div className={styles.valueText}>
                 {connection.tokenMasked ? `已设置（${connection.tokenMasked}）` : '未设置（将使用本地登录 session）'}

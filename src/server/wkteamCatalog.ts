@@ -19,7 +19,7 @@ const endpointSchema = z.object({
 })
 
 const catalogSchema = z.object({
-  generatedAt: z.number().optional(),
+  generatedAt: z.union([z.string(), z.number()]).optional(),
   catalog: z.array(z.unknown())
 })
 
@@ -57,4 +57,3 @@ export async function loadWkteamCatalogMap(filePath: string): Promise<Map<string
 
   return map
 }
-

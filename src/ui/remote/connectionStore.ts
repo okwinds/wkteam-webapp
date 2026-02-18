@@ -5,6 +5,7 @@ export type ConnectionSettings = {
   mode: ConnectionMode
   baseUrl: string
   tokenPersistence: TokenPersistence
+  wkteamWId: string
 }
 
 const SETTINGS_KEY = 'wkteam.connection.v1.settings'
@@ -17,7 +18,7 @@ const TOKEN_KEY = 'wkteam.connection.v1.token'
  * - 返回：默认值 + 已保存值
  */
 export function loadConnectionSettings(): ConnectionSettings {
-  const defaults: ConnectionSettings = { mode: 'local', baseUrl: '', tokenPersistence: 'session' }
+  const defaults: ConnectionSettings = { mode: 'local', baseUrl: '', tokenPersistence: 'session', wkteamWId: '' }
   try {
     const raw = localStorage.getItem(SETTINGS_KEY)
     if (!raw) return defaults
@@ -25,7 +26,8 @@ export function loadConnectionSettings(): ConnectionSettings {
     return {
       mode: parsed.mode === 'server' ? 'server' : 'local',
       baseUrl: typeof parsed.baseUrl === 'string' && parsed.baseUrl.trim() ? parsed.baseUrl.trim() : defaults.baseUrl,
-      tokenPersistence: parsed.tokenPersistence === 'local' ? 'local' : 'session'
+      tokenPersistence: parsed.tokenPersistence === 'local' ? 'local' : 'session',
+      wkteamWId: typeof parsed.wkteamWId === 'string' ? parsed.wkteamWId : defaults.wkteamWId
     }
   } catch {
     return defaults
@@ -45,7 +47,8 @@ export function saveConnectionSettings(patch: Partial<ConnectionSettings>) {
     ...patch,
     mode: patch.mode === 'server' ? 'server' : current.mode,
     tokenPersistence: patch.tokenPersistence === 'local' ? 'local' : patch.tokenPersistence === 'session' ? 'session' : current.tokenPersistence,
-    baseUrl: typeof patch.baseUrl === 'string' ? patch.baseUrl.trim() : current.baseUrl
+    baseUrl: typeof patch.baseUrl === 'string' ? patch.baseUrl.trim() : current.baseUrl,
+    wkteamWId: typeof patch.wkteamWId === 'string' ? patch.wkteamWId : current.wkteamWId
   }
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(next))
 }

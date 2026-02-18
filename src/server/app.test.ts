@@ -411,6 +411,37 @@ describe('server app', () => {
     expect(last?.headers.authorization).toBe('Bearer upstream_token')
   })
 
+  it('default catalog path loads successfully and upstream call does not return WKTEAM_CATALOG_UNAVAILABLE', async () => {
+    const upstream = await startMockUpstream()
+    const s = await startTestServer({
+      configOverrides: {
+        UPSTREAM_BASE_URL: upstream.baseUrl,
+        UPSTREAM_AUTHORIZATION: 'Bearer upstream_token',
+        UPSTREAM_AUTH_HEADER_NAME: 'Authorization'
+      }
+    })
+
+    cleanup = async () => {
+      await s.close()
+      await upstream.close()
+    }
+
+    const resp = await fetch(`${s.baseUrl}/api/upstream/call`, {
+      method: 'POST',
+      headers: { ...s.authHeader, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        operationId: 'te_shu_cdnDownFile',
+        params: { wId: 'wid_001', cdnUrl: 'https://cdn.example.com/a.jpg', aeskey: 'aes_001', fileType: 'image' }
+      })
+    })
+    const text = await resp.text()
+    expect(resp.status, text).toBe(200)
+    expect(text).not.toContain('WKTEAM_CATALOG_UNAVAILABLE')
+
+    const last = upstream.getLast()
+    expect(last?.url).toBe('/cdnDownFile')
+  })
+
   it('hydrate downloads media via te_shu_cdnDownFile and updates message dataUrl', async () => {
     const calls: Array<{ url: string; body: any }> = []
     const fetchImpl = vi.fn(async (input: any, init?: any) => {

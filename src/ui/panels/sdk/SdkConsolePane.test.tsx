@@ -4,6 +4,7 @@ import userEvent from '@testing-library/user-event'
 import { AppProvider } from '../../state/AppProvider'
 import { ConnectionProvider } from '../../remote/ConnectionProvider'
 import { SdkConsolePane } from './SdkConsolePane'
+import { saveConnectionSettings } from '../../remote/connectionStore'
 
 describe('SdkConsolePane', () => {
   beforeEach(() => {
@@ -213,5 +214,70 @@ describe('SdkConsolePane', () => {
     await waitFor(() => {
       expect(screen.getByText(/无效的 base64 格式/)).toBeInTheDocument()
     })
+  })
+
+  it('保存 wkteamWId 后，SDK 控制台在选中 endpoint 时 wId 参数会被自动填入', async () => {
+    // 先保存 wkteamWId 到 connection settings
+    saveConnectionSettings({ wkteamWId: '23456789012' })
+
+    // 设置 BFF 连接
+    localStorage.setItem(
+      'wkteam.connection.v1.settings',
+      JSON.stringify({
+        mode: 'server',
+        baseUrl: 'http://127.0.0.1',
+        tokenPersistence: 'session',
+        wkteamWId: '23456789012'
+      })
+    )
+    sessionStorage.setItem('wkteam.connection.v1.token', 'bff_token_1234567890')
+
+    const fetchMock = vi.fn(async (input: any) => {
+      const url = typeof input === 'string' ? input : String(input?.url ?? '')
+      if (url === '/wkteam-api-catalog.json') {
+        return new Response(
+          JSON.stringify({
+            generatedAt: '2026-02-14T00:00:00.000Z',
+            catalog: [
+              {
+                kind: 'endpoint',
+                operationId: 'op_sendText',
+                title: 'Send Text',
+                module: 'test',
+                method: 'POST',
+                path: '/sendText',
+                headers: [{ name: 'Authorization', value: 'login' }],
+                params: [
+                  { 参数名: 'wId', 必选: '是', 类型: 'String', 说明: '登录实例标识' },
+                  { 参数名: 'wcId', 必选: '是', 类型: 'String', 说明: '联系人ID' }
+                ]
+              }
+            ]
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } }
+        )
+      }
+      return new Response('not found', { status: 404 })
+    })
+    vi.stubGlobal('fetch', fetchMock as any)
+
+    render(
+      <AppProvider>
+        <ConnectionProvider>
+          <SdkConsolePane />
+        </ConnectionProvider>
+      </AppProvider>
+    )
+
+    // 等待 catalog 加载
+    await screen.findAllByText('op_sendText')
+
+    // 验证 wId 输入框已经被自动填充
+    const wIdInput = await screen.findByLabelText('参数 wId') as HTMLInputElement
+    expect(wIdInput.value).toBe('23456789012')
+
+    // 验证 wcId 等其他参数为空（未自动填充）
+    const wcIdInput = await screen.findByLabelText('参数 wcId') as HTMLInputElement
+    expect(wcIdInput.value).toBe('')
   })
 })

@@ -102,7 +102,15 @@ export function SdkConsolePane() {
   useEffect(() => {
     if (!selected) return
     const init: Record<string, string> = {}
-    for (const p of selected.params) init[p.name] = params[p.name] ?? ''
+    for (const p of selected.params) {
+      const savedValue = params[p.name]
+      // 自动填充 wId 参数：当当前值为空且 settings 中有保存的值时
+      if (p.name === 'wId' && !savedValue && connection.settings.wkteamWId) {
+        init[p.name] = connection.settings.wkteamWId
+      } else {
+        init[p.name] = savedValue ?? ''
+      }
+    }
     setParams(init)
     setResultJson('')
     // eslint-disable-next-line react-hooks/exhaustive-deps

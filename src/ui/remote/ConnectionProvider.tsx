@@ -14,6 +14,7 @@ export type ConnectionState = {
 export type ConnectionActions = {
   setMode: (mode: ConnectionSettings['mode']) => void
   setBaseUrl: (baseUrl: string) => void
+  setWkteamWId: (wId: string) => void
   setToken: (token: string, persistence: TokenPersistence) => void
   setTokenPersistence: (persistence: TokenPersistence) => void
   loginLocal: (password: string) => Promise<boolean>
@@ -95,6 +96,7 @@ export function ConnectionProvider(props: { children: React.ReactNode }) {
     return {
       setMode: (mode) => setSettings((s) => ({ ...s, mode })),
       setBaseUrl: (baseUrl) => setSettings((s) => ({ ...s, baseUrl })),
+      setWkteamWId: (wId) => setSettings((s) => ({ ...s, wkteamWId: wId })),
       setToken: (tokenValue, persistence) => {
         saveApiToken(tokenValue, persistence)
         setSettings((s) => ({ ...s, tokenPersistence: persistence }))
