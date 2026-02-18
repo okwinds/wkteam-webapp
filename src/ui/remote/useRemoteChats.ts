@@ -159,15 +159,16 @@ export function useRemoteChats(client: BffClient | null): RemoteChatsModel {
 
   const connectSse = useCallback(() => {
     const { baseUrl, token } = connectionInfo
-    if (!baseUrl || !token || !client) return
+    if (!client) return
     if (sseRef.current) return // already connecting/connected
 
     setSseState('connecting')
     setSseMessage(null)
 
     // Build SSE URL with token in query (EventSource doesn't support custom headers)
-    const normalizedBaseUrl = baseUrl.replace(/\/$/, '')
-    const sseUrl = `${normalizedBaseUrl}/api/events?token=${encodeURIComponent(token)}`
+    const normalizedBaseUrl = baseUrl ? baseUrl.replace(/\/$/, '') : ''
+    const basePath = normalizedBaseUrl ? `${normalizedBaseUrl}/api/events` : '/api/events'
+    const sseUrl = token ? `${basePath}?token=${encodeURIComponent(token)}` : basePath
 
     const es = new EventSource(sseUrl)
     sseRef.current = es
@@ -335,4 +336,3 @@ export function useRemoteChats(client: BffClient | null): RemoteChatsModel {
     refresh
   }
 }
-

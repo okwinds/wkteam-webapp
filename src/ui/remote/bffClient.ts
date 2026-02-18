@@ -51,6 +51,9 @@ export type BffMessage = BffTextMessage | BffImageMessage | BffFileMessage
 
 export type BffClient = {
   testAuth: () => Promise<'ok' | 'auth_failed' | 'error'>
+  loginLocal: (password: string) => Promise<void>
+  logoutLocal: () => Promise<void>
+  getMe: () => Promise<boolean>
   listConversations: () => Promise<BffConversation[]>
   createConversation: (input: { title: string; peerId: string }) => Promise<BffConversation>
   deleteConversation: (conversationId: string) => Promise<void>
@@ -79,17 +82,50 @@ const errorSchema = z.object({
  * - 功能：封装对 `/api/*` 的调用与错误解析
  * - 约束：token 只用于请求头，不在任何日志/错误信息中输出
  */
-export function createBffClient(opts: { baseUrl: string; token: string }): BffClient {
+export function createBffClient(opts: { baseUrl: string; token?: string | null }): BffClient {
   const baseUrl = opts.baseUrl.replace(/\/$/, '')
-  const authHeader = { authorization: `Bearer ${opts.token}` }
+  const token = (opts.token ?? '').trim()
+  const authHeader: Record<string, string> = token ? { authorization: `Bearer ${token}` } : {}
+
+  type HeaderRecord = Record<string, string>
+
+  const toHeaderRecord = (input?: HeadersInit): HeaderRecord => {
+    const out: HeaderRecord = {}
+    if (!input) return out
+
+    if (typeof Headers !== 'undefined' && input instanceof Headers) {
+      input.forEach((value, key) => {
+        out[key.toLowerCase()] = value
+      })
+      return out
+    }
+
+    if (Array.isArray(input)) {
+      for (const pair of input) {
+        const [key, value] = pair
+        out[String(key).toLowerCase()] = String(value)
+      }
+      return out
+    }
+
+    for (const [key, value] of Object.entries(input)) {
+      if (typeof value === 'undefined') continue
+      out[key.toLowerCase()] = String(value)
+    }
+    return out
+  }
+
+  const buildHeaders = (extra?: HeadersInit): HeaderRecord => {
+    // 约束：为兼容 fetch mock/单测，headers 使用 plain object（可通过 `.authorization` 读取）
+    // 语义：authHeader 先写入，extra 可覆盖（与之前 Headers 合并逻辑一致）
+    return { ...toHeaderRecord(authHeader), ...toHeaderRecord(extra) }
+  }
 
   const callJson = async <T>(path: string, init?: RequestInit): Promise<T> => {
     const resp = await fetch(`${baseUrl}${path}`, {
       ...init,
-      headers: {
-        ...authHeader,
-        ...(init?.headers ?? {})
-      }
+      credentials: 'include',
+      headers: buildHeaders(init?.headers)
     })
     if (!resp.ok) {
       const text = await resp.text().catch(() => '')
@@ -106,12 +142,30 @@ export function createBffClient(opts: { baseUrl: string; token: string }): BffCl
   return {
     async testAuth() {
       try {
-        const resp = await fetch(`${baseUrl}/api/conversations`, { headers: authHeader })
+        const resp = await fetch(`${baseUrl}/api/conversations`, { headers: buildHeaders(), credentials: 'include' })
         if (resp.status === 401) return 'auth_failed'
         if (!resp.ok) return 'error'
         return 'ok'
       } catch {
         return 'error'
+      }
+    },
+    async loginLocal(password) {
+      await callJson<{ ok: true }>('/api/auth/login', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ password })
+      })
+    },
+    async logoutLocal() {
+      await callJson<{ ok: true }>('/api/auth/logout', { method: 'POST' })
+    },
+    async getMe() {
+      try {
+        const resp = await fetch(`${baseUrl}/api/auth/me`, { headers: buildHeaders(), credentials: 'include' })
+        return resp.ok
+      } catch {
+        return false
       }
     },
     async listConversations() {

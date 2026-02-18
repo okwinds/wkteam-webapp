@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import type { ServerConfig } from './config.js'
 import { FileDb, makeId, type Conversation, type DbV1, type Message } from './db.js'
@@ -37,10 +38,47 @@ export async function createAppServer(
     .map((s) => s.trim())
     .filter(Boolean)
 
+  const sessionCookieName = 'wkteam_session'
+  const loginPassword = (deps.config.LOCAL_LOGIN_PASSWORD || '').trim() || deps.config.BFF_API_TOKEN
+  const sessions = new Map<string, { createdAt: number }>()
+
+  const parseCookieHeader = (header: string | null) => {
+    if (!header) return new Map<string, string>()
+    const out = new Map<string, string>()
+    for (const part of header.split(';')) {
+      const raw = part.trim()
+      if (!raw) continue
+      const idx = raw.indexOf('=')
+      if (idx < 0) continue
+      const k = raw.slice(0, idx).trim()
+      const v = raw.slice(idx + 1).trim()
+      if (!k) continue
+      try {
+        out.set(k, decodeURIComponent(v))
+      } catch {
+        out.set(k, v)
+      }
+    }
+    return out
+  }
+
+  const pickSessionId = (req: IncomingMessage) => {
+    const cookieHeader = typeof req.headers.cookie === 'string' ? req.headers.cookie : null
+    const cookies = parseCookieHeader(cookieHeader)
+    const sid = cookies.get(sessionCookieName)
+    return typeof sid === 'string' && sid.trim() ? sid.trim() : null
+  }
+
+  const requireSessionAuth = (req: IncomingMessage) => {
+    const sid = pickSessionId(req)
+    return sid != null && sessions.has(sid)
+  }
+
   const requireApiAuth = (req: IncomingMessage) => {
     const auth = req.headers.authorization
     const expected = `Bearer ${deps.config.BFF_API_TOKEN}`
-    return typeof auth === 'string' && auth === expected
+    if (typeof auth === 'string' && auth === expected) return true
+    return requireSessionAuth(req)
   }
 
   const requireWebhookSecret = (req: IncomingMessage) => {
@@ -263,11 +301,61 @@ export async function createAppServer(
 
     if (pathname.startsWith('/api/')) {
       const queryToken = url.searchParams.get('token')
-      const ok = pathname === '/api/events' ? requireApiAuth(req) || queryToken === deps.config.BFF_API_TOKEN : requireApiAuth(req)
-      if (!ok) {
-        writeJson(res, 401, { error: { code: 'UNAUTHORIZED', message: 'missing or invalid token' } })
+      const isAuthRoute = pathname === '/api/auth/login' || pathname === '/api/auth/logout' || pathname === '/api/auth/me'
+      if (!isAuthRoute) {
+        const ok =
+          pathname === '/api/events'
+            ? requireApiAuth(req) || queryToken === deps.config.BFF_API_TOKEN
+            : requireApiAuth(req)
+        if (!ok) {
+          writeJson(res, 401, { error: { code: 'UNAUTHORIZED', message: 'missing or invalid token' } })
+          return
+        }
+      }
+    }
+
+    if (method === 'POST' && pathname === '/api/auth/login') {
+      const body = await readJsonBody(req, deps.config.MAX_BODY_BYTES)
+      if (!body.ok) {
+        writeJson(res, 400, { error: body.error })
         return
       }
+      const parsed = z.object({ password: z.string().min(1).max(200) }).safeParse(body.value)
+      if (!parsed.success) {
+        writeJson(res, 400, { error: { code: 'BAD_REQUEST', message: 'invalid request body' } })
+        return
+      }
+      if (parsed.data.password !== loginPassword) {
+        writeJson(res, 401, { error: { code: 'UNAUTHORIZED', message: 'invalid password' } })
+        return
+      }
+
+      const sid = randomUUID()
+      sessions.set(sid, { createdAt: deps.nowMs() })
+      res.setHeader(
+        'set-cookie',
+        `${sessionCookieName}=${encodeURIComponent(sid)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${60 * 60 * 24 * 30}`
+      )
+      writeJson(res, 200, { ok: true })
+      return
+    }
+
+    if (method === 'POST' && pathname === '/api/auth/logout') {
+      const sid = pickSessionId(req)
+      if (sid) sessions.delete(sid)
+      res.setHeader('set-cookie', `${sessionCookieName}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0`)
+      writeJson(res, 200, { ok: true })
+      return
+    }
+
+    if (method === 'GET' && pathname === '/api/auth/me') {
+      const ok = requireApiAuth(req)
+      if (!ok) {
+        writeJson(res, 401, { error: { code: 'UNAUTHORIZED', message: 'not logged in' } })
+        return
+      }
+      writeJson(res, 200, { ok: true })
+      return
     }
 
     if (pathname.startsWith('/webhooks/')) {

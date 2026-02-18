@@ -14,6 +14,7 @@ function makeConfig(overrides?: Partial<import('./config').ServerConfig>): impor
     DATA_DIR: './data',
     BFF_API_TOKEN: 'test_token_1234567890',
     WEBHOOK_SECRET: 'test_webhook_secret_123456',
+    LOCAL_LOGIN_PASSWORD: '',
     WEBHOOK_IP_ALLOWLIST: '',
     WEBHOOK_RATE_LIMIT_PER_MIN: 0,
     CORS_ALLOW_ORIGINS: '',
@@ -118,6 +119,46 @@ describe('server app', () => {
     const resp = await fetch(`${s.baseUrl}/healthz`)
     expect(resp.status).toBe(200)
     const json = await resp.json()
+    expect(json.ok).toBe(true)
+  })
+
+  it('local login issues session cookie and can access /api without Authorization header', async () => {
+    const s = await startTestServer()
+    cleanup = s.close
+
+    const loginResp = await fetch(`${s.baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ password: 'test_token_1234567890' })
+    })
+    expect(loginResp.status).toBe(200)
+    const setCookie = loginResp.headers.get('set-cookie')
+    expect(setCookie).toBeTruthy()
+    const cookie = String(setCookie).split(';')[0]
+
+    const listResp = await fetch(`${s.baseUrl}/api/conversations`, { headers: { cookie } })
+    expect(listResp.status).toBe(200)
+    const json = await listResp.json()
+    expect(Array.isArray(json.conversations)).toBe(true)
+  })
+
+  it('/api/auth/me returns 401 when not logged in, 200 when logged in', async () => {
+    const s = await startTestServer()
+    cleanup = s.close
+
+    const before = await fetch(`${s.baseUrl}/api/auth/me`)
+    expect(before.status).toBe(401)
+
+    const loginResp = await fetch(`${s.baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ password: 'test_token_1234567890' })
+    })
+    const cookie = String(loginResp.headers.get('set-cookie') ?? '').split(';')[0]
+
+    const after = await fetch(`${s.baseUrl}/api/auth/me`, { headers: { cookie } })
+    expect(after.status).toBe(200)
+    const json = await after.json()
     expect(json.ok).toBe(true)
   })
 

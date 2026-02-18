@@ -16,6 +16,8 @@ export type ConnectionActions = {
   setBaseUrl: (baseUrl: string) => void
   setToken: (token: string, persistence: TokenPersistence) => void
   setTokenPersistence: (persistence: TokenPersistence) => void
+  loginLocal: (password: string) => Promise<boolean>
+  logoutLocal: () => Promise<void>
   testConnection: () => Promise<{ status: BffConnectionStatus; error: string | null }>
 }
 
@@ -37,7 +39,7 @@ export function ConnectionProvider(props: { children: React.ReactNode }) {
 
   const client = useMemo(() => {
     if (settings.mode !== 'server') return null
-    if (!token) return null
+    // token 允许为空：此时可走“本地登录 session cookie”
     return createBffClient({ baseUrl: settings.baseUrl, token })
   }, [settings.baseUrl, settings.mode, token])
 
@@ -64,12 +66,6 @@ export function ConnectionProvider(props: { children: React.ReactNode }) {
       const baseUrl = settings.baseUrl.trim()
       // baseUrl 允许为空：表示走同源路径（用于 Vite proxy 或同域部署）
       const t = loadApiToken(settings)
-      if (!t) {
-        setStatus('disconnected')
-        const err = 'token 未设置'
-        setLastError(err)
-        return { status: 'disconnected' as const, error: err }
-      }
       const c = createBffClient({ baseUrl, token: t })
       const result = await c.testAuth()
       if (result === 'ok') {
@@ -79,7 +75,7 @@ export function ConnectionProvider(props: { children: React.ReactNode }) {
       }
       if (result === 'auth_failed') {
         setStatus('auth_failed')
-        const err = '鉴权失败，请检查 token'
+        const err = t ? '鉴权失败，请检查 token 或重新登录' : '未登录（请先登录或设置 token）'
         setLastError(err)
         return { status: 'auth_failed' as const, error: err }
       }
@@ -107,6 +103,31 @@ export function ConnectionProvider(props: { children: React.ReactNode }) {
         const currentToken = loadApiToken(settings)
         if (currentToken) saveApiToken(currentToken, persistence)
         setSettings((s) => ({ ...s, tokenPersistence: persistence }))
+      },
+      loginLocal: async (password) => {
+        if (settings.mode !== 'server') return false
+        const baseUrl = settings.baseUrl.trim()
+        const t = loadApiToken(settings)
+        const c = createBffClient({ baseUrl, token: t })
+        try {
+          await c.loginLocal(password)
+          const r = await testConnection()
+          return r.status === 'connected'
+        } catch (e) {
+          setStatus('auth_failed')
+          const err = e instanceof Error ? e.message : '登录失败'
+          setLastError(err)
+          return false
+        }
+      },
+      logoutLocal: async () => {
+        if (settings.mode !== 'server') return
+        const baseUrl = settings.baseUrl.trim()
+        const t = loadApiToken(settings)
+        const c = createBffClient({ baseUrl, token: t })
+        await c.logoutLocal().catch(() => {})
+        setStatus('disconnected')
+        setLastError(null)
       },
       testConnection
     }

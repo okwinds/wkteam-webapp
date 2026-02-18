@@ -107,7 +107,9 @@ export function SettingsPanel() {
 
             <div className={styles.row}>
               <div className={styles.label}>token</div>
-              <div className={styles.valueText}>{connection.tokenMasked ? `已设置（${connection.tokenMasked}）` : '未设置'}</div>
+              <div className={styles.valueText}>
+                {connection.tokenMasked ? `已设置（${connection.tokenMasked}）` : '未设置（将使用本地登录 session）'}
+              </div>
             </div>
 
             <div className={styles.row}>
@@ -144,11 +146,36 @@ export function SettingsPanel() {
                 type="button"
                 className={styles.btn}
                 onClick={async () => {
+                  const pwd = window.prompt('请输入本地登录口令（默认与 BFF_API_TOKEN 相同）') ?? ''
+                  if (!pwd.trim()) {
+                    actions.pushToast({ kind: 'error', title: '未登录', detail: '口令为空。' })
+                    return
+                  }
+                  const ok = await connectionActions.loginLocal(pwd)
+                  actions.pushToast({ kind: ok ? 'info' : 'error', title: ok ? '登录成功' : '登录失败', detail: ok ? '已建立本地 session。' : connection.lastError ?? '请检查口令。' })
+                }}
+              >
+                登录（本地）
+              </button>
+              <button
+                type="button"
+                className={styles.btn}
+                onClick={async () => {
+                  await connectionActions.logoutLocal()
+                  actions.pushToast({ kind: 'info', title: '已退出', detail: 'session 已清理。' })
+                }}
+              >
+                退出登录
+              </button>
+              <button
+                type="button"
+                className={styles.btn}
+                onClick={async () => {
                   const r = await connectionActions.testConnection()
                   if (r.status === 'connected') {
                     actions.pushToast({ kind: 'info', title: '连接成功', detail: '服务端可用。' })
                   } else if (r.status === 'auth_failed') {
-                    actions.pushToast({ kind: 'error', title: '鉴权失败', detail: '请检查 token。' })
+                    actions.pushToast({ kind: 'error', title: '鉴权失败', detail: r.error ?? '请检查 token 或先登录。' })
                   } else if (r.status === 'error') {
                     actions.pushToast({ kind: 'error', title: '连接失败', detail: r.error ?? '网络错误或服务不可用。' })
                   }

@@ -16,6 +16,9 @@ export function loadServerConfig(env: NodeJS.ProcessEnv) {
 
     BFF_API_TOKEN: z.string().min(10),
     WEBHOOK_SECRET: z.string().min(10),
+    // 可选：单机单用户登录口令（用于 session cookie 登录）
+    // - 若未设置，则默认复用 BFF_API_TOKEN 作为登录口令（避免新增必填配置）
+    LOCAL_LOGIN_PASSWORD: z.string().optional().default(''),
     // 可选：webhook 额外安全增强
     WEBHOOK_IP_ALLOWLIST: z.string().optional().default(''),
     WEBHOOK_RATE_LIMIT_PER_MIN: z.coerce.number().int().optional().default(0),

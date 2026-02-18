@@ -37,6 +37,9 @@ describe('useRemoteChats', () => {
 
     mockClient = {
       testAuth: vi.fn().mockResolvedValue('ok'),
+      loginLocal: vi.fn().mockResolvedValue(undefined),
+      logoutLocal: vi.fn().mockResolvedValue(undefined),
+      getMe: vi.fn().mockResolvedValue(true),
       listConversations: vi.fn().mockResolvedValue([]),
       createConversation: vi.fn(),
       deleteConversation: vi.fn(),
