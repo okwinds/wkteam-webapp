@@ -25,6 +25,8 @@ export type TextMessage = {
   sentAt: number
   kind: 'text'
   text: string
+  raw?: string
+  rawTruncated?: boolean
 }
 
 export type ImageMessage = {
@@ -35,6 +37,8 @@ export type ImageMessage = {
   sentAt: number
   kind: 'image'
   image: { dataUrl: string; alt: string }
+  raw?: string
+  rawTruncated?: boolean
 }
 
 export type FileMessage = {
@@ -45,6 +49,8 @@ export type FileMessage = {
   sentAt: number
   kind: 'file'
   file: { name: string; mime: string; dataUrl: string }
+  raw?: string
+  rawTruncated?: boolean
 }
 
 export type Message = TextMessage | ImageMessage | FileMessage
@@ -98,7 +104,9 @@ const dbSchemaV1 = z.object({
         source: z.union([z.literal('human'), z.literal('ai'), z.literal('system'), z.literal('webhook')]),
         sentAt: z.number(),
         kind: z.literal('text'),
-        text: z.string()
+        text: z.string(),
+        raw: z.string().optional(),
+        rawTruncated: z.boolean().optional()
       }),
       z.object({
         id: z.string(),
@@ -107,7 +115,9 @@ const dbSchemaV1 = z.object({
         source: z.union([z.literal('human'), z.literal('ai'), z.literal('system'), z.literal('webhook')]),
         sentAt: z.number(),
         kind: z.literal('image'),
-        image: z.object({ dataUrl: z.string(), alt: z.string() })
+        image: z.object({ dataUrl: z.string(), alt: z.string() }),
+        raw: z.string().optional(),
+        rawTruncated: z.boolean().optional()
       }),
       z.object({
         id: z.string(),
@@ -116,7 +126,9 @@ const dbSchemaV1 = z.object({
         source: z.union([z.literal('human'), z.literal('ai'), z.literal('system'), z.literal('webhook')]),
         sentAt: z.number(),
         kind: z.literal('file'),
-        file: z.object({ name: z.string(), mime: z.string(), dataUrl: z.string() })
+        file: z.object({ name: z.string(), mime: z.string(), dataUrl: z.string() }),
+        raw: z.string().optional(),
+        rawTruncated: z.boolean().optional()
       })
     ])
   ),
@@ -206,4 +218,3 @@ export class FileDb {
 export function makeId(prefix: string, nowMs: number) {
   return `${prefix}_${nowMs}_${Math.random().toString(16).slice(2, 8)}`
 }
-

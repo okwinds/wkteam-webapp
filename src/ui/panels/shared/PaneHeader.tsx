@@ -10,7 +10,9 @@ import type { ReactNode } from 'react'
 export function PaneHeader(props: { title: string; right?: ReactNode }) {
   return (
     <div className={styles.root}>
-      <div className={styles.title}>{props.title}</div>
+      <div className={styles.title} role="heading" aria-level={2}>
+        {props.title}
+      </div>
       <div className={styles.right}>{props.right}</div>
     </div>
   )

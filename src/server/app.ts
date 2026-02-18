@@ -48,9 +48,68 @@ export async function createAppServer(
     return typeof secret === 'string' && secret === deps.config.WEBHOOK_SECRET
   }
 
+  const webhookIpAllowlist = deps.config.WEBHOOK_IP_ALLOWLIST.split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+
+  const webhookRateLimitPerMin = Number.isFinite(deps.config.WEBHOOK_RATE_LIMIT_PER_MIN)
+    ? deps.config.WEBHOOK_RATE_LIMIT_PER_MIN
+    : 0
+
+  const webhookRateState = new Map<string, { windowStart: number; count: number }>()
+
+  const pickClientIp = (req: IncomingMessage) => {
+    const xff = req.headers['x-forwarded-for']
+    if (typeof xff === 'string') {
+      const first = xff.split(',')[0]?.trim()
+      if (first) return first
+    }
+    const ra = req.socket.remoteAddress
+    return typeof ra === 'string' && ra.trim() ? ra.trim() : null
+  }
+
+  const normalizeIp = (ip: string) => {
+    let v = ip.trim()
+    if (v.startsWith('::ffff:')) v = v.slice('::ffff:'.length)
+    const m = /^(\d{1,3}(?:\.\d{1,3}){3}):\d+$/.exec(v)
+    if (m?.[1]) v = m[1]
+    return v
+  }
+
   const persist = async () => {
     dbState = { ...dbState, updatedAt: deps.nowMs() }
     await deps.db.save(dbState)
+  }
+
+  const sseClients = new Set<ServerResponse>()
+
+  const writeSse = (res: ServerResponse, event: string, data: unknown) => {
+    res.write(`event: ${event}\n`)
+    res.write(`data: ${JSON.stringify(data)}\n\n`)
+  }
+
+  const emitMessageCreated = (message: Message) => {
+    if (sseClients.size === 0) return
+    const payload = { conversationId: message.conversationId, messageId: message.id, kind: message.kind, ts: deps.nowMs() }
+    for (const client of sseClients) {
+      try {
+        writeSse(client, 'message.created', payload)
+      } catch {
+        sseClients.delete(client)
+      }
+    }
+  }
+
+  const emitMessageUpdated = (message: Message) => {
+    if (sseClients.size === 0) return
+    const payload = { conversationId: message.conversationId, messageId: message.id, kind: message.kind, ts: deps.nowMs() }
+    for (const client of sseClients) {
+      try {
+        writeSse(client, 'message.updated', payload)
+      } catch {
+        sseClients.delete(client)
+      }
+    }
   }
 
   let automationQueue: Promise<void> = Promise.resolve()
@@ -76,10 +135,111 @@ export async function createAppServer(
     return { wId: m[1], peerKind: m[2] as 'u' | 'g', peerId: m[3] }
   }
 
+  const pickStringByKeyAliases = (root: unknown, keys: string[]) => {
+    const want = new Set(keys.map((k) => k.toLowerCase()))
+    const queue: Array<{ v: unknown; depth: number }> = [{ v: root, depth: 0 }]
+    const seen = new Set<any>()
+    let steps = 0
+    while (queue.length > 0 && steps < 2000) {
+      steps += 1
+      const cur = queue.shift()!
+      if (cur.depth > 6) continue
+      const v: any = cur.v
+      if (!v || typeof v !== 'object') continue
+      if (seen.has(v)) continue
+      seen.add(v)
+      for (const [k, child] of Object.entries(v)) {
+        if (want.has(k.toLowerCase()) && typeof child === 'string') {
+          const s = child.trim()
+          if (s) return s
+        }
+        if (child && typeof child === 'object') queue.push({ v: child, depth: cur.depth + 1 })
+      }
+    }
+    return null
+  }
+
+  const normalizeBase64 = (input: string) => {
+    let s = input.trim()
+    if (!s) return null
+    if (s.startsWith('data:')) {
+      const m = /^data:[^;]+;base64,([\s\S]+)$/i.exec(s)
+      s = (m?.[1] ?? '').trim()
+    }
+    s = s.replace(/\s+/g, '')
+    if (!s) return null
+    // 允许 base64 与 base64url（兼容上游差异）
+    if (!/^[A-Za-z0-9+/_-]+={0,2}$/.test(s)) return null
+    if (s.length < 4) return null
+    return s
+  }
+
+  const extractHydrateParamsFromRaw = (raw: string | null | undefined) => {
+    if (!raw) return { cdnUrl: null as string | null, aeskey: null as string | null }
+    const tryParse = () => {
+      const t = raw.trim()
+      if (!t.startsWith('{') && !t.startsWith('[')) return null
+      try {
+        return JSON.parse(t) as unknown
+      } catch {
+        return null
+      }
+    }
+    const obj = tryParse()
+
+    const cdnUrl =
+      (obj ? pickStringByKeyAliases(obj, ['cdnUrl', 'cdn_url', 'url', 'path']) : null) ??
+      (() => {
+        const m = /(?:cdnUrl|cdn_url)\s*["']?\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i.exec(raw)
+        if (m?.[1]) return m[1]
+        const u = /(https?:\/\/[^\s"'<>]+)\b/i.exec(raw)
+        return u?.[1] ?? null
+      })()
+
+    const aeskey =
+      (obj ? pickStringByKeyAliases(obj, ['aeskey', 'aesKey', 'aes_key']) : null) ??
+      (() => {
+        const m = /(?:aeskey|aesKey|aes_key)\s*["']?\s*[:=]\s*["']([^"']+)["']/i.exec(raw)
+        return m?.[1] ?? null
+      })()
+
+    return { cdnUrl: cdnUrl?.trim() || null, aeskey: aeskey?.trim() || null }
+  }
+
+  const extractBase64FromUpstreamResponse = (data: unknown) => {
+    if (typeof data === 'string') return normalizeBase64(data)
+    if (!data || typeof data !== 'object') return null
+    const s =
+      pickStringByKeyAliases(data, ['base64', 'fileBase64', 'content', 'data']) ??
+      (() => {
+        const v: any = data as any
+        const nested =
+          (v?.data && typeof v.data === 'object' ? pickStringByKeyAliases(v.data, ['base64', 'fileBase64', 'content']) : null) ?? null
+        return nested
+      })()
+    return typeof s === 'string' ? normalizeBase64(s) : null
+  }
+
   const handler = async (req: IncomingMessage, res: ServerResponse) => {
     const url = parseUrl(req)
-    const { pathname } = url
+    let pathname = url.pathname
     const method = (req.method ?? 'GET').toUpperCase()
+
+    // 兼容：/webhooks/<secret>/wkteam/* 形态（剥离 path secret，路由归一到原路径，避免破坏现有 handler）
+    let pathSecret: string | null = null
+    if (pathname.startsWith('/webhooks/')) {
+      const segs = pathname.split('/').filter(Boolean)
+      // segs: ["webhooks", <maybeSecret>, "wkteam", ...]
+      if (segs.length >= 4 && segs[0] === 'webhooks' && segs[2] === 'wkteam') {
+        const raw = segs[1] ?? ''
+        try {
+          pathSecret = decodeURIComponent(raw)
+        } catch {
+          pathSecret = raw
+        }
+        pathname = `/${['webhooks', ...segs.slice(2)].join('/')}`
+      }
+    }
 
     const origin = typeof req.headers.origin === 'string' ? req.headers.origin : null
     const corsAllowed =
@@ -102,16 +262,45 @@ export async function createAppServer(
     }
 
     if (pathname.startsWith('/api/')) {
-      if (!requireApiAuth(req)) {
+      const queryToken = url.searchParams.get('token')
+      const ok = pathname === '/api/events' ? requireApiAuth(req) || queryToken === deps.config.BFF_API_TOKEN : requireApiAuth(req)
+      if (!ok) {
         writeJson(res, 401, { error: { code: 'UNAUTHORIZED', message: 'missing or invalid token' } })
         return
       }
     }
 
     if (pathname.startsWith('/webhooks/')) {
+      const ipRaw = pickClientIp(req)
+      const ip = ipRaw ? normalizeIp(ipRaw) : null
+
+      if (webhookIpAllowlist.length > 0) {
+        if (!ip || !webhookIpAllowlist.includes(ip)) {
+          writeJson(res, 403, { error: { code: 'FORBIDDEN', message: 'webhook ip not allowlisted' } })
+          return
+        }
+      }
+
+      if (webhookRateLimitPerMin > 0) {
+        const key = ip ?? 'unknown'
+        const windowStart = Math.floor(deps.nowMs() / 60_000) * 60_000
+        const cur = webhookRateState.get(key)
+        if (!cur || cur.windowStart !== windowStart) {
+          webhookRateState.set(key, { windowStart, count: 1 })
+        } else {
+          cur.count += 1
+        }
+        const next = webhookRateState.get(key)!
+        if (next.count > webhookRateLimitPerMin) {
+          writeJson(res, 429, { error: { code: 'RATE_LIMITED', message: 'webhook rate limit exceeded' } })
+          return
+        }
+      }
+
       const headerOk = requireWebhookSecret(req)
       const queryOk = url.searchParams.get('secret') === deps.config.WEBHOOK_SECRET
-      if (!headerOk && !queryOk) {
+      const pathOk = typeof pathSecret === 'string' && pathSecret === deps.config.WEBHOOK_SECRET
+      if (!headerOk && !queryOk && !pathOk) {
         writeJson(res, 401, { error: { code: 'UNAUTHORIZED', message: 'missing or invalid webhook secret' } })
         return
       }
@@ -123,6 +312,32 @@ export async function createAppServer(
         return b.lastActivityAt - a.lastActivityAt
       })
       writeJson(res, 200, { conversations })
+      return
+    }
+
+    if (method === 'GET' && pathname === '/api/events') {
+      res.statusCode = 200
+      res.setHeader('content-type', 'text/event-stream; charset=utf-8')
+      res.setHeader('cache-control', 'no-cache')
+      res.setHeader('connection', 'keep-alive')
+
+      req.socket.setTimeout(0)
+      res.write(': ok\n\n')
+
+      sseClients.add(res)
+      const heartbeat = setInterval(() => {
+        try {
+          res.write(`: ping ${deps.nowMs()}\n\n`)
+        } catch {
+          // ignore
+        }
+      }, 15000)
+      ;(heartbeat as any).unref?.()
+
+      req.on('close', () => {
+        clearInterval(heartbeat)
+        sseClients.delete(res)
+      })
       return
     }
 
@@ -302,8 +517,137 @@ export async function createAppServer(
         return { ...c, lastMessageId: message.id, lastActivityAt: message.sentAt, updatedAt: now }
       })
       await persist()
+      emitMessageCreated(message)
       writeJson(res, 200, { message })
       return
+    }
+
+    const hydrateParams = matchPath('/api/messages/:messageId/hydrate', pathname)
+    if (hydrateParams && method === 'POST') {
+      const messageId = hydrateParams.messageId
+      const idx = dbState.messages.findIndex((m) => m.id === messageId)
+      if (idx < 0) {
+        writeJson(res, 404, { error: { code: 'NOT_FOUND', message: 'message not found' } })
+        return
+      }
+
+      const msg = dbState.messages[idx]!
+      if (msg.kind !== 'image' && msg.kind !== 'file') {
+        writeJson(res, 400, { error: { code: 'BAD_REQUEST', message: 'only image/file messages can be hydrated' } })
+        return
+      }
+
+      const existingDataUrl = msg.kind === 'image' ? msg.image.dataUrl : msg.file.dataUrl
+      if (existingDataUrl.startsWith('data:')) {
+        writeJson(res, 200, { ok: true, message: msg })
+        return
+      }
+
+      const info = parseWkConversationId(msg.conversationId)
+      if (!info) {
+        writeJson(res, 400, { error: { code: 'BAD_REQUEST', message: 'invalid wk conversationId' } })
+        return
+      }
+
+      const { cdnUrl, aeskey } = extractHydrateParamsFromRaw(msg.raw)
+      if (!cdnUrl || !/^https?:\/\//i.test(cdnUrl)) {
+        writeJson(res, 400, { error: { code: 'BAD_REQUEST', message: 'missing or invalid cdnUrl in message.raw' } })
+        return
+      }
+      if (!aeskey) {
+        writeJson(res, 400, { error: { code: 'BAD_REQUEST', message: 'missing aeskey in message.raw' } })
+        return
+      }
+
+      if (!wkteamCatalog) {
+        writeJson(res, 503, { error: { code: 'WKTEAM_CATALOG_UNAVAILABLE', message: 'wkteam catalog unavailable' } })
+        return
+      }
+      const upstreamBaseUrl = deps.config.UPSTREAM_BASE_URL.trim().replace(/\/$/, '')
+      const upstreamAuth = deps.config.UPSTREAM_AUTHORIZATION.trim()
+      if (!upstreamBaseUrl || !upstreamAuth) {
+        writeJson(res, 503, { error: { code: 'UPSTREAM_NOT_CONFIGURED', message: 'upstream not configured' } })
+        return
+      }
+      const ep = wkteamCatalog.get('te_shu_cdnDownFile')
+      if (!ep) {
+        writeJson(res, 503, { error: { code: 'UNKNOWN_OPERATION_ID', message: 'te_shu_cdnDownFile operationId not found in catalog' } })
+        return
+      }
+
+      const controller = new AbortController()
+      const t = setTimeout(() => controller.abort(), deps.config.UPSTREAM_TIMEOUT_MS)
+      try {
+        const resp = await deps.fetchImpl(`${upstreamBaseUrl}${ep.path}`, {
+          method: ep.method,
+          headers: {
+            'content-type': 'application/json',
+            [deps.config.UPSTREAM_AUTH_HEADER_NAME]: upstreamAuth
+          },
+          body: JSON.stringify({ wId: info.wId, cdnUrl, aeskey, fileType: msg.kind }),
+          signal: controller.signal
+        })
+        const text = await resp.text().catch(() => '')
+        if (!resp.ok) {
+          writeJson(res, 502, {
+            error: {
+              code: 'UPSTREAM_HTTP_ERROR',
+              message: `upstream http ${resp.status}`.slice(0, 120),
+              detail: text.slice(0, 400)
+            }
+          })
+          return
+        }
+
+        let data: unknown = text
+        try {
+          data = text ? JSON.parse(text) : null
+        } catch {
+          // keep text
+        }
+
+        const base64 = extractBase64FromUpstreamResponse(data)
+        if (!base64) {
+          writeJson(res, 502, { error: { code: 'UPSTREAM_BAD_RESPONSE', message: 'missing base64 in upstream response' } })
+          return
+        }
+
+        const mime =
+          msg.kind === 'file'
+            ? msg.file.mime || 'application/octet-stream'
+            : msg.kind === 'image'
+              ? 'image/jpeg'
+              : 'application/octet-stream'
+
+        const nextDataUrl = `data:${mime};base64,${base64}`
+        const sizeBytes = Buffer.byteLength(nextDataUrl, 'utf-8')
+        if (sizeBytes > deps.config.MAX_DATAURL_BYTES) {
+          writeJson(res, 400, { error: { code: 'DATAURL_TOO_LARGE', message: 'hydrated dataUrl too large' } })
+          return
+        }
+
+        const nextMessage: Message =
+          msg.kind === 'image'
+            ? { ...msg, image: { ...msg.image, dataUrl: nextDataUrl } }
+            : { ...msg, file: { ...msg.file, dataUrl: nextDataUrl } }
+
+        dbState.messages[idx] = nextMessage
+        await persist()
+        emitMessageUpdated(nextMessage)
+        writeJson(res, 200, { ok: true, message: nextMessage })
+        return
+      } catch (e) {
+        const isAbortError = typeof DOMException !== 'undefined' && e instanceof DOMException && e.name === 'AbortError'
+        if (isAbortError) {
+          writeJson(res, 504, { error: { code: 'UPSTREAM_TIMEOUT', message: 'upstream timeout' } })
+          return
+        }
+        const msg = e instanceof Error ? e.message : 'UPSTREAM_UNKNOWN_ERROR'
+        writeJson(res, 502, { error: { code: 'UPSTREAM_NETWORK_ERROR', message: msg.slice(0, 200) } })
+        return
+      } finally {
+        clearTimeout(t)
+      }
     }
 
     if (method === 'GET' && pathname === '/api/automation/status') {
@@ -474,6 +818,7 @@ export async function createAppServer(
           return { ...c, lastMessageId: aiMessage.id, lastActivityAt: aiMessage.sentAt, updatedAt: now }
         })
         await persist()
+        emitMessageCreated(aiMessage)
         writeJson(res, 200, { message: aiMessage })
         return
       } catch (e) {
@@ -546,6 +891,7 @@ export async function createAppServer(
       })
 
       await persist()
+      emitMessageCreated(inbound)
 
       // V0：若开启自动化，则直接触发一次 AI（最小通用策略：对任何新消息都回复）
       if (dbState.automationEnabled) {
@@ -588,6 +934,7 @@ export async function createAppServer(
               model: { baseUrlHost: new URL(deps.config.OPENAI_BASE_URL).host, model: deps.config.OPENAI_MODEL }
             })
             await persist()
+            emitMessageCreated(aiMessage)
           } catch (e) {
             dbState.automationRuns.push({
               id: runId,
@@ -617,12 +964,27 @@ export async function createAppServer(
         return
       }
 
+      const rawPayload = body.value
+      let raw = ''
+      let rawTruncated = false
+      try {
+        raw = JSON.stringify(rawPayload)
+        if (Buffer.byteLength(raw, 'utf-8') > deps.config.MAX_WEBHOOK_RAW_BYTES) {
+          rawTruncated = true
+          raw = Buffer.from(raw, 'utf-8').subarray(0, deps.config.MAX_WEBHOOK_RAW_BYTES).toString('utf-8')
+        }
+      } catch {
+        raw = '"(raw stringify failed)"'
+        rawTruncated = true
+      }
+
       const parsed = z
         .object({
           wcId: z.string().min(1).optional(),
           account: z.string().optional(),
           messageType: z.string().min(1),
-          data: z.object({
+          data: z
+            .object({
             wId: z.string().min(1),
             fromUser: z.string().min(1),
             fromGroup: z.string().optional(),
@@ -630,14 +992,74 @@ export async function createAppServer(
             msgId: z.union([z.number(), z.string()]).optional(),
             newMsgId: z.union([z.number(), z.string()]).optional(),
             timestamp: z.union([z.number(), z.string()]).optional(),
-            content: z.string().optional(),
+            content: z.unknown().optional(),
             self: z.boolean().optional()
           })
+            .passthrough()
         })
+        .passthrough()
         .safeParse(body.value)
       if (!parsed.success) {
         writeJson(res, 400, { error: { code: 'BAD_REQUEST', message: 'invalid wkteam callback body' } })
         return
+      }
+
+      const pickStringByPaths = (root: unknown, paths: Array<readonly string[]>) => {
+        for (const path of paths) {
+          let cur: any = root
+          for (const k of path) {
+            if (cur == null || typeof cur !== 'object') {
+              cur = undefined
+              break
+            }
+            cur = (cur as any)[k]
+          }
+          if (typeof cur === 'string') {
+            const v = cur.trim()
+            if (v) return v
+          }
+        }
+        return null
+      }
+
+      const pickHttpUrl = (root: unknown) => {
+        const v = pickStringByPaths(root, [
+          ['data', 'url'],
+          ['data', 'path'],
+          ['data', 'content'],
+          ['data', 'cdnUrl'],
+          ['url'],
+          ['path'],
+          ['content']
+        ])
+        if (!v) return null
+        return /^https?:\/\//i.test(v) ? v : null
+      }
+
+      const isLikelyBase64 = (s: string) => {
+        const v = s.trim()
+        if (v.length < 128) return false
+        if (v.startsWith('data:')) return false
+        if (v.includes('<') || v.includes('>')) return false
+        return /^[A-Za-z0-9+/=\r\n]+$/.test(v)
+      }
+
+      const pickXmlTitle = (xml: string) => {
+        const m = /<title>\s*(?:<!\[CDATA\[([\s\S]*?)\]\]>|([\s\S]*?))\s*<\/title>/i.exec(xml)
+        const v = (m?.[1] ?? m?.[2] ?? '').trim()
+        return v || null
+      }
+
+      const inferFileNameFromUrlOrPath = (input: string | null) => {
+        if (!input) return null
+        try {
+          const u = new URL(input)
+          const last = u.pathname.split('/').filter(Boolean).slice(-1)[0]
+          return last ? decodeURIComponent(last) : null
+        } catch {
+          const last = input.split('/').filter(Boolean).slice(-1)[0]
+          return last || null
+        }
       }
 
       const now = deps.nowMs()
@@ -666,15 +1088,76 @@ export async function createAppServer(
 
       const conversationId = `wk:${wId}:${peerKind}:${peerId}`
       const messageId = makeId('m', now)
-      const inboundText = parsed.data.data.content ?? '(empty)'
-      const inbound: Message = {
+      const kind: Message['kind'] =
+        messageType === '60001' || messageType === '80001'
+          ? 'text'
+          : messageType === '60002' || messageType === '80002'
+            ? 'image'
+            : messageType === '60008' || messageType === '80008'
+              ? 'file'
+              : 'text'
+
+      const common = {
         id: messageId,
         conversationId,
-        direction: 'inbound',
-        source: 'webhook',
+        direction: 'inbound' as const,
+        source: 'webhook' as const,
         sentAt,
-        kind: 'text',
-        text: inboundText
+        raw,
+        rawTruncated
+      }
+
+      let inbound: Message
+      if (kind === 'text') {
+        const contentStr = typeof parsed.data.data.content === 'string' ? parsed.data.data.content : null
+        const inboundText = contentStr?.trim() ? contentStr : messageType === '60001' || messageType === '80001' ? '(empty)' : '[unsupported messageType]'
+        inbound = { ...common, kind: 'text', text: inboundText }
+      } else if (kind === 'image') {
+        const url = pickHttpUrl(rawPayload)
+        const contentStr = pickStringByPaths(rawPayload, [['data', 'content'], ['content']])
+        const fileName = pickStringByPaths(rawPayload, [['data', 'fileName'], ['data', 'filename'], ['data', 'name']]) ?? inferFileNameFromUrlOrPath(url)
+        const dataUrl =
+          url ??
+          (contentStr && contentStr.startsWith('data:') ? contentStr : null) ??
+          (contentStr && isLikelyBase64(contentStr) ? `data:image/jpeg;base64,${contentStr.trim()}` : null) ??
+          ''
+        inbound = {
+          ...common,
+          kind: 'image',
+          image: { dataUrl, alt: fileName ?? '图片' }
+        }
+      } else {
+        const url = pickHttpUrl(rawPayload)
+        const contentStr = pickStringByPaths(rawPayload, [['data', 'content'], ['content']])
+        const xmlTitle = contentStr ? pickXmlTitle(contentStr) : null
+        const fileName =
+          pickStringByPaths(rawPayload, [['data', 'fileName'], ['data', 'filename'], ['data', 'name']]) ??
+          xmlTitle ??
+          inferFileNameFromUrlOrPath(url) ??
+          'unknown.bin'
+
+        const mimeFromDataUrl = (() => {
+          if (!contentStr || !contentStr.startsWith('data:')) return null
+          const m = /^data:([^;]+);base64,/i.exec(contentStr)
+          return m?.[1]?.trim() || null
+        })()
+
+        const mime =
+          pickStringByPaths(rawPayload, [['data', 'mime'], ['data', 'contentType'], ['mime'], ['contentType']]) ??
+          mimeFromDataUrl ??
+          'application/octet-stream'
+
+        const dataUrl =
+          url ??
+          (contentStr && contentStr.startsWith('data:') ? contentStr : null) ??
+          (contentStr && isLikelyBase64(contentStr) ? `data:${mime};base64,${contentStr.trim()}` : null) ??
+          ''
+
+        inbound = {
+          ...common,
+          kind: 'file',
+          file: { name: fileName, mime, dataUrl }
+        }
       }
 
       if (!dbState.conversations.some((c) => c.id === conversationId)) {
@@ -699,124 +1182,94 @@ export async function createAppServer(
         return { ...c, lastMessageId: inbound.id, lastActivityAt: inbound.sentAt, updatedAt: now }
       })
       await persist()
+      emitMessageCreated(inbound)
 
-      const shouldAutomate = dbState.automationEnabled && !self && (messageType === '60001' || messageType === '80001')
+      const shouldAutomate =
+        dbState.automationEnabled &&
+        !self &&
+        (messageType === '60001' ||
+          messageType === '80001' ||
+          messageType === '60002' ||
+          messageType === '80002' ||
+          messageType === '60008' ||
+          messageType === '80008')
+
       if (shouldAutomate) {
         void enqueueAutomation(async () => {
           const runId = makeId('run', deps.nowMs())
           const startedAt = deps.nowMs()
           try {
-            const reply = await openai.chatCompletions({
-              baseUrl: deps.config.OPENAI_BASE_URL,
-              path: deps.config.OPENAI_PATH_CHAT_COMPLETIONS,
-              apiKey: deps.config.OPENAI_API_KEY,
-              model: deps.config.OPENAI_MODEL,
-              timeoutMs: deps.config.OPENAI_TIMEOUT_MS,
-              messages: [{ role: 'user', content: inbound.text }]
-            })
-            const aiId = makeId('m', deps.nowMs())
-            const aiMessage: Message = {
-              id: aiId,
-              conversationId,
-              direction: 'outbound',
-              source: 'ai',
-              sentAt: deps.nowMs(),
-              kind: 'text',
-              text: reply.content || '(empty)'
-            }
-            dbState.messages.push(aiMessage)
-            dbState.conversations = dbState.conversations.map((c) => {
-              if (c.id !== conversationId) return c
-              return { ...c, lastMessageId: aiMessage.id, lastActivityAt: aiMessage.sentAt, updatedAt: deps.nowMs() }
-            })
-            await persist()
-
-            if (!wkteamCatalog) {
-              dbState.automationRuns.push({
-                id: runId,
-                trigger: 'webhook',
-                conversationId,
-                inputMessageId: inbound.id,
-                outputMessageId: aiMessage.id,
-                status: 'failed',
-                startedAt,
-                endedAt: deps.nowMs(),
-                error: { code: 'WKTEAM_CATALOG_UNAVAILABLE', message: 'wkteam catalog unavailable' },
-                model: { baseUrlHost: new URL(deps.config.OPENAI_BASE_URL).host, model: deps.config.OPENAI_MODEL }
-              })
-              await persist()
-              return
-            }
-
-            const upstreamBaseUrl = deps.config.UPSTREAM_BASE_URL.trim().replace(/\/$/, '')
-            const upstreamAuth = deps.config.UPSTREAM_AUTHORIZATION.trim()
-            if (!upstreamBaseUrl || !upstreamAuth) {
-              dbState.automationRuns.push({
-                id: runId,
-                trigger: 'webhook',
-                conversationId,
-                inputMessageId: inbound.id,
-                outputMessageId: aiMessage.id,
-                status: 'failed',
-                startedAt,
-                endedAt: deps.nowMs(),
-                error: { code: 'UPSTREAM_NOT_CONFIGURED', message: 'upstream not configured' },
-                model: { baseUrlHost: new URL(deps.config.OPENAI_BASE_URL).host, model: deps.config.OPENAI_MODEL }
-              })
-              await persist()
-              return
-            }
-
-            const info = parseWkConversationId(conversationId)
-            if (!info) {
-              dbState.automationRuns.push({
-                id: runId,
-                trigger: 'webhook',
-                conversationId,
-                inputMessageId: inbound.id,
-                outputMessageId: aiMessage.id,
-                status: 'failed',
-                startedAt,
-                endedAt: deps.nowMs(),
-                error: { code: 'BAD_CONVERSATION_ID', message: 'invalid wk conversationId' },
-                model: { baseUrlHost: new URL(deps.config.OPENAI_BASE_URL).host, model: deps.config.OPENAI_MODEL }
-              })
-              await persist()
-              return
-            }
-
-            const ep = wkteamCatalog.get('xiao_xi_fa_song_fa_song_wen_ben_xiao_xi')
-            if (!ep) {
-              dbState.automationRuns.push({
-                id: runId,
-                trigger: 'webhook',
-                conversationId,
-                inputMessageId: inbound.id,
-                outputMessageId: aiMessage.id,
-                status: 'failed',
-                startedAt,
-                endedAt: deps.nowMs(),
-                error: { code: 'UNKNOWN_OPERATION_ID', message: 'sendText operationId not found in catalog' },
-                model: { baseUrlHost: new URL(deps.config.OPENAI_BASE_URL).host, model: deps.config.OPENAI_MODEL }
-              })
-              await persist()
-              return
-            }
-
-            const controller = new AbortController()
-            const t = setTimeout(() => controller.abort(), deps.config.UPSTREAM_TIMEOUT_MS)
-            try {
-              const resp = await deps.fetchImpl(`${upstreamBaseUrl}${ep.path}`, {
-                method: ep.method,
-                headers: {
-                  'content-type': 'application/json',
-                  [deps.config.UPSTREAM_AUTH_HEADER_NAME]: upstreamAuth
-                },
-                body: JSON.stringify({ wId: info.wId, wcId: info.peerId, content: aiMessage.text }),
-                signal: controller.signal
-              })
-              if (!resp.ok) {
+	            const sendUpstreamJson = async (opts: {
+	              upstreamBaseUrl: string
+	              upstreamAuth: string
+	              ep: { method: string; path: string }
+	              params: unknown
+	            }) => {
+              const controller = new AbortController()
+              const t = setTimeout(() => controller.abort(), deps.config.UPSTREAM_TIMEOUT_MS)
+              try {
+                const resp = await deps.fetchImpl(`${opts.upstreamBaseUrl}${opts.ep.path}`, {
+                  method: opts.ep.method,
+                  headers: {
+                    'content-type': 'application/json',
+                    [deps.config.UPSTREAM_AUTH_HEADER_NAME]: opts.upstreamAuth
+                  },
+                  body: JSON.stringify(opts.params),
+                  signal: controller.signal
+                })
                 const text = await resp.text().catch(() => '')
+                if (!resp.ok) {
+                  return { ok: false as const, status: resp.status, text }
+                }
+                try {
+                  return { ok: true as const, data: text ? JSON.parse(text) : null }
+                } catch {
+                  return { ok: true as const, data: text }
+                }
+              } catch (e) {
+                const isAbortError =
+                  typeof DOMException !== 'undefined' && e instanceof DOMException && e.name === 'AbortError'
+                return {
+                  ok: false as const,
+                  status: isAbortError ? 504 : 502,
+                  text: e instanceof Error ? e.message : 'UPSTREAM_UNKNOWN_ERROR',
+                  code: isAbortError ? 'UPSTREAM_TIMEOUT' : 'UPSTREAM_SEND_FAILED'
+                }
+              } finally {
+                clearTimeout(t)
+	              }
+	            }
+	
+	            const inboundId = inbound.id
+	
+	            if (inbound.kind === 'text') {
+              const reply = await openai.chatCompletions({
+                baseUrl: deps.config.OPENAI_BASE_URL,
+                path: deps.config.OPENAI_PATH_CHAT_COMPLETIONS,
+                apiKey: deps.config.OPENAI_API_KEY,
+                model: deps.config.OPENAI_MODEL,
+                timeoutMs: deps.config.OPENAI_TIMEOUT_MS,
+                messages: [{ role: 'user', content: inbound.text }]
+              })
+              const aiId = makeId('m', deps.nowMs())
+              const aiMessage: Message = {
+                id: aiId,
+                conversationId,
+                direction: 'outbound',
+                source: 'ai',
+                sentAt: deps.nowMs(),
+                kind: 'text',
+                text: reply.content || '(empty)'
+              }
+              dbState.messages.push(aiMessage)
+              dbState.conversations = dbState.conversations.map((c) => {
+                if (c.id !== conversationId) return c
+                return { ...c, lastMessageId: aiMessage.id, lastActivityAt: aiMessage.sentAt, updatedAt: deps.nowMs() }
+              })
+              await persist()
+              emitMessageCreated(aiMessage)
+
+              if (!wkteamCatalog) {
                 dbState.automationRuns.push({
                   id: runId,
                   trigger: 'webhook',
@@ -826,51 +1279,447 @@ export async function createAppServer(
                   status: 'failed',
                   startedAt,
                   endedAt: deps.nowMs(),
-                  error: { code: 'UPSTREAM_SEND_FAILED', message: `upstream http ${resp.status}: ${text}`.slice(0, 200) },
+                  error: { code: 'WKTEAM_CATALOG_UNAVAILABLE', message: 'wkteam catalog unavailable' },
                   model: { baseUrlHost: new URL(deps.config.OPENAI_BASE_URL).host, model: deps.config.OPENAI_MODEL }
                 })
                 await persist()
                 return
               }
-            } catch (e) {
-              const isAbortError =
-                typeof DOMException !== 'undefined' && e instanceof DOMException && e.name === 'AbortError'
+
+              const upstreamBaseUrl = deps.config.UPSTREAM_BASE_URL.trim().replace(/\/$/, '')
+              const upstreamAuth = deps.config.UPSTREAM_AUTHORIZATION.trim()
+              if (!upstreamBaseUrl || !upstreamAuth) {
+                dbState.automationRuns.push({
+                  id: runId,
+                  trigger: 'webhook',
+                  conversationId,
+                  inputMessageId: inbound.id,
+                  outputMessageId: aiMessage.id,
+                  status: 'failed',
+                  startedAt,
+                  endedAt: deps.nowMs(),
+                  error: { code: 'UPSTREAM_NOT_CONFIGURED', message: 'upstream not configured' },
+                  model: { baseUrlHost: new URL(deps.config.OPENAI_BASE_URL).host, model: deps.config.OPENAI_MODEL }
+                })
+                await persist()
+                return
+              }
+
+              const info = parseWkConversationId(conversationId)
+              if (!info) {
+                dbState.automationRuns.push({
+                  id: runId,
+                  trigger: 'webhook',
+                  conversationId,
+                  inputMessageId: inbound.id,
+                  outputMessageId: aiMessage.id,
+                  status: 'failed',
+                  startedAt,
+                  endedAt: deps.nowMs(),
+                  error: { code: 'BAD_CONVERSATION_ID', message: 'invalid wk conversationId' },
+                  model: { baseUrlHost: new URL(deps.config.OPENAI_BASE_URL).host, model: deps.config.OPENAI_MODEL }
+                })
+                await persist()
+                return
+              }
+
+              const ep = wkteamCatalog.get('xiao_xi_fa_song_fa_song_wen_ben_xiao_xi')
+              if (!ep) {
+                dbState.automationRuns.push({
+                  id: runId,
+                  trigger: 'webhook',
+                  conversationId,
+                  inputMessageId: inbound.id,
+                  outputMessageId: aiMessage.id,
+                  status: 'failed',
+                  startedAt,
+                  endedAt: deps.nowMs(),
+                  error: { code: 'UNKNOWN_OPERATION_ID', message: 'sendText operationId not found in catalog' },
+                  model: { baseUrlHost: new URL(deps.config.OPENAI_BASE_URL).host, model: deps.config.OPENAI_MODEL }
+                })
+                await persist()
+                return
+              }
+
+              const resp = await sendUpstreamJson({ upstreamBaseUrl, upstreamAuth, ep, params: { wId: info.wId, wcId: info.peerId, content: aiMessage.text } })
+              if (!resp.ok) {
+                dbState.automationRuns.push({
+                  id: runId,
+                  trigger: 'webhook',
+                  conversationId,
+                  inputMessageId: inbound.id,
+                  outputMessageId: aiMessage.id,
+                  status: 'failed',
+                  startedAt,
+                  endedAt: deps.nowMs(),
+                  error: {
+                    code: resp.code ?? 'UPSTREAM_SEND_FAILED',
+                    message: `upstream http ${resp.status}: ${resp.text}`.slice(0, 200)
+                  },
+                  model: { baseUrlHost: new URL(deps.config.OPENAI_BASE_URL).host, model: deps.config.OPENAI_MODEL }
+                })
+                await persist()
+                return
+              }
+
               dbState.automationRuns.push({
                 id: runId,
                 trigger: 'webhook',
                 conversationId,
                 inputMessageId: inbound.id,
                 outputMessageId: aiMessage.id,
-                status: 'failed',
+                status: 'success',
                 startedAt,
                 endedAt: deps.nowMs(),
-                error: {
-                  code: isAbortError ? 'UPSTREAM_TIMEOUT' : 'UPSTREAM_SEND_FAILED',
-                  message: e instanceof Error ? e.message : 'UPSTREAM_UNKNOWN_ERROR'
-                },
                 model: { baseUrlHost: new URL(deps.config.OPENAI_BASE_URL).host, model: deps.config.OPENAI_MODEL }
               })
               await persist()
               return
-            } finally {
-              clearTimeout(t)
             }
 
-            dbState.automationRuns.push({
-              id: runId,
-              trigger: 'webhook',
-              conversationId,
-              inputMessageId: inbound.id,
-              outputMessageId: aiMessage.id,
-              status: 'success',
-              startedAt,
-              endedAt: deps.nowMs(),
-              model: { baseUrlHost: new URL(deps.config.OPENAI_BASE_URL).host, model: deps.config.OPENAI_MODEL }
-            })
+            if (inbound.kind === 'image') {
+              if (!wkteamCatalog) {
+                dbState.automationRuns.push({
+                  id: runId,
+                  trigger: 'webhook',
+                  conversationId,
+                  inputMessageId: inbound.id,
+                  outputMessageId: null,
+                  status: 'failed',
+                  startedAt,
+                  endedAt: deps.nowMs(),
+                  error: { code: 'WKTEAM_CATALOG_UNAVAILABLE', message: 'wkteam catalog unavailable' }
+                })
+                await persist()
+                return
+              }
+
+              const upstreamBaseUrl = deps.config.UPSTREAM_BASE_URL.trim().replace(/\/$/, '')
+              const upstreamAuth = deps.config.UPSTREAM_AUTHORIZATION.trim()
+              if (!upstreamBaseUrl || !upstreamAuth) {
+                dbState.automationRuns.push({
+                  id: runId,
+                  trigger: 'webhook',
+                  conversationId,
+                  inputMessageId: inbound.id,
+                  outputMessageId: null,
+                  status: 'failed',
+                  startedAt,
+                  endedAt: deps.nowMs(),
+                  error: { code: 'UPSTREAM_NOT_CONFIGURED', message: 'upstream not configured' }
+                })
+                await persist()
+                return
+              }
+
+              const info = parseWkConversationId(conversationId)
+              if (!info) {
+                dbState.automationRuns.push({
+                  id: runId,
+                  trigger: 'webhook',
+                  conversationId,
+                  inputMessageId: inbound.id,
+                  outputMessageId: null,
+                  status: 'failed',
+                  startedAt,
+                  endedAt: deps.nowMs(),
+                  error: { code: 'BAD_CONVERSATION_ID', message: 'invalid wk conversationId' }
+                })
+                await persist()
+                return
+              }
+
+              const url = inbound.image.dataUrl
+              if (!/^https?:\/\//i.test(url)) {
+                dbState.automationRuns.push({
+                  id: runId,
+                  trigger: 'webhook',
+                  conversationId,
+                  inputMessageId: inbound.id,
+                  outputMessageId: null,
+                  status: 'skipped',
+                  startedAt,
+                  endedAt: deps.nowMs(),
+                  error: { code: 'SKIPPED_NO_HTTP_URL', message: 'image.dataUrl is not http(s) url' }
+                })
+                await persist()
+                return
+              }
+
+              const uploadEp = wkteamCatalog.get('te_shu_uploadCdnImage')
+              const sendEp = wkteamCatalog.get('xiao_xi_fa_song_fa_song_tu_pian_xiao_xi2')
+              if (!uploadEp || !sendEp) {
+                dbState.automationRuns.push({
+                  id: runId,
+                  trigger: 'webhook',
+                  conversationId,
+                  inputMessageId: inbound.id,
+                  outputMessageId: null,
+                  status: 'failed',
+                  startedAt,
+                  endedAt: deps.nowMs(),
+                  error: { code: 'UNKNOWN_OPERATION_ID', message: 'uploadCdnImage/sendImage2 operationId not found in catalog' }
+                })
+                await persist()
+                return
+              }
+
+              const upload = await sendUpstreamJson({ upstreamBaseUrl, upstreamAuth, ep: uploadEp, params: { wId: info.wId, content: url } })
+              const cdnUrl =
+                upload.ok && upload.data && typeof (upload.data as any).cdnUrl === 'string'
+                  ? String((upload.data as any).cdnUrl)
+                  : url
+
+              const outId = makeId('m', deps.nowMs())
+              const out: Message = {
+                id: outId,
+                conversationId,
+                direction: 'outbound',
+                source: 'system',
+                sentAt: deps.nowMs(),
+                kind: 'image',
+                image: { dataUrl: cdnUrl, alt: inbound.image.alt || '图片' }
+              }
+              dbState.messages.push(out)
+              dbState.conversations = dbState.conversations.map((c) => {
+                if (c.id !== conversationId) return c
+                return { ...c, lastMessageId: out.id, lastActivityAt: out.sentAt, updatedAt: deps.nowMs() }
+              })
+              await persist()
+              emitMessageCreated(out)
+
+              const sent = await sendUpstreamJson({ upstreamBaseUrl, upstreamAuth, ep: sendEp, params: { wId: info.wId, wcId: info.peerId, content: cdnUrl } })
+              if (!sent.ok) {
+                dbState.automationRuns.push({
+                  id: runId,
+                  trigger: 'webhook',
+                  conversationId,
+                  inputMessageId: inbound.id,
+                  outputMessageId: out.id,
+                  status: 'failed',
+                  startedAt,
+                  endedAt: deps.nowMs(),
+                  error: {
+                    code: sent.code ?? 'UPSTREAM_SEND_FAILED',
+                    message: `upstream http ${sent.status}: ${sent.text}`.slice(0, 200)
+                  }
+                })
+                await persist()
+                return
+              }
+
+              dbState.automationRuns.push({
+                id: runId,
+                trigger: 'webhook',
+                conversationId,
+                inputMessageId: inbound.id,
+                outputMessageId: out.id,
+                status: 'success',
+                startedAt,
+                endedAt: deps.nowMs()
+              })
+              await persist()
+              return
+            }
+
+            if (inbound.kind === 'file') {
+              if (!wkteamCatalog) {
+                dbState.automationRuns.push({
+                  id: runId,
+                  trigger: 'webhook',
+                  conversationId,
+                  inputMessageId: inbound.id,
+                  outputMessageId: null,
+                  status: 'failed',
+                  startedAt,
+                  endedAt: deps.nowMs(),
+                  error: { code: 'WKTEAM_CATALOG_UNAVAILABLE', message: 'wkteam catalog unavailable' }
+                })
+                await persist()
+                return
+              }
+
+              const upstreamBaseUrl = deps.config.UPSTREAM_BASE_URL.trim().replace(/\/$/, '')
+              const upstreamAuth = deps.config.UPSTREAM_AUTHORIZATION.trim()
+              if (!upstreamBaseUrl || !upstreamAuth) {
+                dbState.automationRuns.push({
+                  id: runId,
+                  trigger: 'webhook',
+                  conversationId,
+                  inputMessageId: inbound.id,
+                  outputMessageId: null,
+                  status: 'failed',
+                  startedAt,
+                  endedAt: deps.nowMs(),
+                  error: { code: 'UPSTREAM_NOT_CONFIGURED', message: 'upstream not configured' }
+                })
+                await persist()
+                return
+              }
+
+              const info = parseWkConversationId(conversationId)
+              if (!info) {
+                dbState.automationRuns.push({
+                  id: runId,
+                  trigger: 'webhook',
+                  conversationId,
+                  inputMessageId: inbound.id,
+                  outputMessageId: null,
+                  status: 'failed',
+                  startedAt,
+                  endedAt: deps.nowMs(),
+                  error: { code: 'BAD_CONVERSATION_ID', message: 'invalid wk conversationId' }
+                })
+                await persist()
+                return
+              }
+
+              const dataUrl = inbound.file.dataUrl
+              const fileName = inbound.file.name || 'unknown.bin'
+
+              const base64Match = /^data:[^;]+;base64,(.*)$/i.exec(dataUrl)
+              const sendFileBase64Ep = wkteamCatalog.get('xiao_xi_fa_song_sendFileBase64')
+              const sendFileEp = wkteamCatalog.get('xiao_xi_fa_song_sendFile')
+
+              const outId = makeId('m', deps.nowMs())
+              const out: Message = {
+                id: outId,
+                conversationId,
+                direction: 'outbound',
+                source: 'system',
+                sentAt: deps.nowMs(),
+                kind: 'file',
+                file: { name: fileName, mime: inbound.file.mime, dataUrl }
+              }
+              dbState.messages.push(out)
+              dbState.conversations = dbState.conversations.map((c) => {
+                if (c.id !== conversationId) return c
+                return { ...c, lastMessageId: out.id, lastActivityAt: out.sentAt, updatedAt: deps.nowMs() }
+              })
+              await persist()
+              emitMessageCreated(out)
+
+              if (base64Match && sendFileBase64Ep) {
+                const base64 = (base64Match[1] ?? '').trim()
+                if (!base64) {
+                  dbState.automationRuns.push({
+                    id: runId,
+                    trigger: 'webhook',
+                    conversationId,
+                    inputMessageId: inbound.id,
+                    outputMessageId: out.id,
+                    status: 'skipped',
+                    startedAt,
+                    endedAt: deps.nowMs(),
+                    error: { code: 'SKIPPED_EMPTY_BASE64', message: 'file dataUrl base64 empty' }
+                  })
+                  await persist()
+                  return
+                }
+                const sent = await sendUpstreamJson({ upstreamBaseUrl, upstreamAuth, ep: sendFileBase64Ep, params: { wId: info.wId, wcId: info.peerId, fileName, base64 } })
+                if (!sent.ok) {
+                  dbState.automationRuns.push({
+                    id: runId,
+                    trigger: 'webhook',
+                    conversationId,
+                    inputMessageId: inbound.id,
+                    outputMessageId: out.id,
+                    status: 'failed',
+                    startedAt,
+                    endedAt: deps.nowMs(),
+                    error: {
+                      code: sent.code ?? 'UPSTREAM_SEND_FAILED',
+                      message: `upstream http ${sent.status}: ${sent.text}`.slice(0, 200)
+                    }
+                  })
+                  await persist()
+                  return
+                }
+
+                dbState.automationRuns.push({
+                  id: runId,
+                  trigger: 'webhook',
+                  conversationId,
+                  inputMessageId: inbound.id,
+                  outputMessageId: out.id,
+                  status: 'success',
+                  startedAt,
+                  endedAt: deps.nowMs()
+                })
+                await persist()
+                return
+              }
+
+              if (/^https?:\/\//i.test(dataUrl) && sendFileEp) {
+                const sent = await sendUpstreamJson({ upstreamBaseUrl, upstreamAuth, ep: sendFileEp, params: { wId: info.wId, wcId: info.peerId, path: dataUrl, fileName } })
+                if (!sent.ok) {
+                  dbState.automationRuns.push({
+                    id: runId,
+                    trigger: 'webhook',
+                    conversationId,
+                    inputMessageId: inbound.id,
+                    outputMessageId: out.id,
+                    status: 'failed',
+                    startedAt,
+                    endedAt: deps.nowMs(),
+                    error: {
+                      code: sent.code ?? 'UPSTREAM_SEND_FAILED',
+                      message: `upstream http ${sent.status}: ${sent.text}`.slice(0, 200)
+                    }
+                  })
+                  await persist()
+                  return
+                }
+
+                dbState.automationRuns.push({
+                  id: runId,
+                  trigger: 'webhook',
+                  conversationId,
+                  inputMessageId: inbound.id,
+                  outputMessageId: out.id,
+                  status: 'success',
+                  startedAt,
+                  endedAt: deps.nowMs()
+                })
+                await persist()
+                return
+              }
+
+              dbState.automationRuns.push({
+                id: runId,
+                trigger: 'webhook',
+                conversationId,
+                inputMessageId: inbound.id,
+                outputMessageId: out.id,
+                status: 'skipped',
+                startedAt,
+                endedAt: deps.nowMs(),
+                error: { code: 'SKIPPED_NO_SENDER', message: 'no sendFileBase64/sendFile path available' }
+              })
+              await persist()
+              return
+            }
+
+	            dbState.automationRuns.push({
+	              id: runId,
+	              trigger: 'webhook',
+	              conversationId,
+	              inputMessageId: inboundId,
+	              outputMessageId: null,
+	              status: 'skipped',
+	              startedAt,
+	              endedAt: deps.nowMs(),
+	              error: { code: 'SKIPPED_UNSUPPORTED_KIND', message: `unsupported kind: ${(inbound as any).kind}` }
+	            })
             await persist()
           } catch (e) {
-            const msg = e instanceof Error ? e.message : 'AI_UNKNOWN_ERROR'
-            const code = msg.startsWith('AI_TIMEOUT') ? 'AI_TIMEOUT' : 'AI_UPSTREAM_ERROR'
+            const msg = e instanceof Error ? e.message : 'AUTOMATION_UNKNOWN_ERROR'
+            const code =
+              inbound.kind === 'text'
+                ? msg.startsWith('AI_TIMEOUT')
+                  ? 'AI_TIMEOUT'
+                  : 'AI_UPSTREAM_ERROR'
+                : 'AUTOMATION_ERROR'
             dbState.automationRuns.push({
               id: runId,
               trigger: 'webhook',
@@ -881,7 +1730,10 @@ export async function createAppServer(
               startedAt,
               endedAt: deps.nowMs(),
               error: { code, message: msg },
-              model: { baseUrlHost: new URL(deps.config.OPENAI_BASE_URL).host, model: deps.config.OPENAI_MODEL }
+              model:
+                inbound.kind === 'text'
+                  ? { baseUrlHost: new URL(deps.config.OPENAI_BASE_URL).host, model: deps.config.OPENAI_MODEL }
+                  : undefined
             })
             await persist()
           }

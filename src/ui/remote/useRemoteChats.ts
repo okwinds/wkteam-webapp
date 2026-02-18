@@ -1,10 +1,31 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Conversation, Message } from '../state/types'
 import type { BffClient, BffConversation, BffMessage } from './bffClient'
+import { loadConnectionSettings, loadApiToken } from './connectionStore'
+
+// SSE connection states
+type SseState = 'idle' | 'connecting' | 'connected' | 'error'
+
+const POLLING_INTERVAL_MS = 5000
 
 type MessageWithSource = Message & { source?: string }
 
+export type ConnectionStatus = SseState | 'polling'
+
 export type RemoteChatsModel = {
+  /**
+   * Real-time connection status for the UI to display
+   * - 'idle': not connected (no client)
+   * - 'connecting': establishing SSE
+   * - 'connected': SSE active
+   * - 'polling': SSE failed, using polling fallback
+   * - 'error': SSE error, will retry
+   */
+  connectionStatus: ConnectionStatus
+  /** Human-readable connection status message (for toast/debug) */
+  connectionMessage: string | null
+
+  // Existing properties...
   conversations: Conversation[]
   selectedConversationId: string | null
   selectedConversation: Conversation | null
@@ -77,6 +98,13 @@ export function useRemoteChats(client: BffClient | null): RemoteChatsModel {
   const [bffMessages, setBffMessages] = useState<BffMessage[]>([])
   const draftsRef = useRef<Map<string, string>>(new Map())
 
+  // SSE and real-time sync states
+  const [sseState, setSseState] = useState<SseState>('idle')
+  const [sseMessage, setSseMessage] = useState<string | null>(null)
+  const sseRef = useRef<EventSource | null>(null)
+  const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const connectionStatus: ConnectionStatus = sseState === 'idle' ? 'idle' : sseState === 'connected' ? 'connected' : sseState === 'error' ? 'polling' : 'connecting'
+
   const refresh = useCallback(async () => {
     if (!client) return
     setLoading(true)
@@ -95,14 +123,102 @@ export function useRemoteChats(client: BffClient | null): RemoteChatsModel {
     }
   }, [client, selectedId])
 
+  // SSE and polling logic for real-time updates
+  // Get connection info from storage
+  const connectionInfo = useMemo(() => {
+    const settings = loadConnectionSettings()
+    const token = loadApiToken(settings)
+    return {
+      baseUrl: settings.baseUrl,
+      token
+    }
+  }, [client]) // re-evaluate when client changes
+
+  const stopPolling = useCallback(() => {
+    if (pollingRef.current) {
+      clearInterval(pollingRef.current)
+      pollingRef.current = null
+    }
+  }, [])
+
+  const stopSse = useCallback(() => {
+    if (sseRef.current) {
+      sseRef.current.close()
+      sseRef.current = null
+    }
+  }, [])
+
+  const startPolling = useCallback(() => {
+    stopPolling()
+    pollingRef.current = setInterval(() => {
+      refresh()
+    }, POLLING_INTERVAL_MS)
+    setSseState('error')
+    setSseMessage('SSE 不可用，已降级到轮询')
+  }, [refresh, stopPolling])
+
+  const connectSse = useCallback(() => {
+    const { baseUrl, token } = connectionInfo
+    if (!baseUrl || !token || !client) return
+    if (sseRef.current) return // already connecting/connected
+
+    setSseState('connecting')
+    setSseMessage(null)
+
+    // Build SSE URL with token in query (EventSource doesn't support custom headers)
+    const normalizedBaseUrl = baseUrl.replace(/\/$/, '')
+    const sseUrl = `${normalizedBaseUrl}/api/events?token=${encodeURIComponent(token)}`
+
+    const es = new EventSource(sseUrl)
+    sseRef.current = es
+
+    es.onopen = () => {
+      setSseState('connected')
+      setSseMessage(null)
+      stopPolling() // stop polling if active
+    }
+
+    es.onmessage = (event) => {
+      // ignore heartbeat comments
+      if (event.data.startsWith(':')) return
+    }
+
+    es.addEventListener('message.created', () => {
+      refresh()
+    })
+
+    es.addEventListener('message.updated', () => {
+      refresh()
+    })
+
+    es.onerror = () => {
+      // EventSource auto-reconnects, but if it fails repeatedly we should fall back
+      setSseState('error')
+      setSseMessage('SSE 连接失败，降级到轮询')
+      stopSse()
+      startPolling()
+    }
+  }, [connectionInfo, client, refresh, stopPolling, stopSse, startPolling])
+
   useEffect(() => {
     setBffConversations([])
     setBffMessages([])
     setSelectedId(null)
     setError(null)
-    if (!client) return
+    if (!client) {
+      setSseState('idle')
+      stopSse()
+      stopPolling()
+      return
+    }
     refresh()
-  }, [client, refresh])
+    // Setup SSE for real-time updates
+    connectSse()
+    return () => {
+      stopSse()
+      stopPolling()
+    }
+  }, [client, refresh, connectSse, stopSse, stopPolling])
 
   const conversations = useMemo(() => {
     return bffConversations.map((c) => mapConversation(c, draftsRef.current.get(c.id) ?? ''))
@@ -206,6 +322,8 @@ export function useRemoteChats(client: BffClient | null): RemoteChatsModel {
     loading,
     aiBusy,
     error,
+    connectionStatus,
+    connectionMessage: sseMessage,
     selectConversation,
     togglePinned,
     deleteConversation,

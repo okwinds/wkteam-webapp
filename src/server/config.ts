@@ -16,11 +16,15 @@ export function loadServerConfig(env: NodeJS.ProcessEnv) {
 
     BFF_API_TOKEN: z.string().min(10),
     WEBHOOK_SECRET: z.string().min(10),
+    // 可选：webhook 额外安全增强
+    WEBHOOK_IP_ALLOWLIST: z.string().optional().default(''),
+    WEBHOOK_RATE_LIMIT_PER_MIN: z.coerce.number().int().optional().default(0),
 
     CORS_ALLOW_ORIGINS: z.string().optional().default(''),
 
     MAX_BODY_BYTES: z.coerce.number().int().min(1024).optional().default(1024 * 1024),
     MAX_DATAURL_BYTES: z.coerce.number().int().min(1024).optional().default(500 * 1024),
+    MAX_WEBHOOK_RAW_BYTES: z.coerce.number().int().min(1024).optional().default(32 * 1024),
 
     OPENAI_BASE_URL: z.string().url(),
     OPENAI_API_KEY: z.string().min(10),

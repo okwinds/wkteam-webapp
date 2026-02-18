@@ -14,6 +14,8 @@ function makeConfig(overrides?: Partial<import('./config').ServerConfig>): impor
     DATA_DIR: './data',
     BFF_API_TOKEN: 'test_token_1234567890',
     WEBHOOK_SECRET: 'test_webhook_secret_123456',
+    WEBHOOK_IP_ALLOWLIST: '',
+    WEBHOOK_RATE_LIMIT_PER_MIN: 0,
     CORS_ALLOW_ORIGINS: '',
     UPSTREAM_BASE_URL: '',
     UPSTREAM_AUTHORIZATION: '',
@@ -22,6 +24,7 @@ function makeConfig(overrides?: Partial<import('./config').ServerConfig>): impor
     WKTEAM_CATALOG_PATH: './public/wkteam-api-catalog.json',
     MAX_BODY_BYTES: 1024 * 1024,
     MAX_DATAURL_BYTES: 500 * 1024,
+    MAX_WEBHOOK_RAW_BYTES: 32 * 1024,
     OPENAI_BASE_URL: 'https://api.example.com',
     OPENAI_API_KEY: 'test_openai_key_1234567890',
     OPENAI_MODEL: 'test-model',
@@ -208,6 +211,91 @@ describe('server app', () => {
     expect(j2.deduped).toBe(true)
   })
 
+  it('webhook supports path secret for wkteam callback (no header/query needed)', async () => {
+    const s = await startTestServer()
+    cleanup = s.close
+
+    const payload = {
+      wcId: 'wxid_bot_001',
+      account: 'test_account',
+      messageType: '60001',
+      data: {
+        wId: 'wid_001',
+        fromUser: 'wxid_peer_123',
+        toUser: 'wxid_bot_001',
+        msgId: 1001,
+        newMsgId: 9002,
+        timestamp: 1700000000,
+        content: '你好',
+        self: false
+      }
+    }
+
+    const ok = await fetch(`${s.baseUrl}/webhooks/${encodeURIComponent(s.webhookHeader['x-webhook-secret'])}/wkteam/callback`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload)
+    })
+    expect(ok.status).toBe(200)
+
+    const list = await fetch(`${s.baseUrl}/api/conversations`, { headers: s.authHeader })
+    const listJson = await list.json()
+    expect(listJson.conversations.length).toBe(1)
+    expect(listJson.conversations[0].id).toBe('wk:wid_001:u:wxid_peer_123')
+  })
+
+  it('webhook IP allowlist rejects non-allowlisted IPs (403)', async () => {
+    const s = await startTestServer({
+      configOverrides: {
+        WEBHOOK_IP_ALLOWLIST: '1.2.3.4'
+      }
+    })
+    cleanup = s.close
+
+    const resp = await fetch(`${s.baseUrl}/webhooks/wkteam/messages`, {
+      method: 'POST',
+      headers: {
+        ...s.webhookHeader,
+        'x-forwarded-for': '9.9.9.9',
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({ dedupeKey: 'k-allowlist-1', conversationId: 'c1', text: 'hi' })
+    })
+    expect(resp.status).toBe(403)
+  })
+
+  it('webhook rate limit rejects when exceeding per-minute threshold (429)', async () => {
+    const s = await startTestServer({
+      nowMs: () => 1700000000000,
+      configOverrides: {
+        WEBHOOK_RATE_LIMIT_PER_MIN: 1
+      }
+    })
+    cleanup = s.close
+
+    const ok1 = await fetch(`${s.baseUrl}/webhooks/wkteam/messages`, {
+      method: 'POST',
+      headers: {
+        ...s.webhookHeader,
+        'x-forwarded-for': '8.8.8.8',
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({ dedupeKey: 'k-rate-1', conversationId: 'c1', text: 'hi' })
+    })
+    expect(ok1.status).toBe(200)
+
+    const tooMany = await fetch(`${s.baseUrl}/webhooks/wkteam/messages`, {
+      method: 'POST',
+      headers: {
+        ...s.webhookHeader,
+        'x-forwarded-for': '8.8.8.8',
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({ dedupeKey: 'k-rate-2', conversationId: 'c1', text: 'hi again' })
+    })
+    expect(tooMany.status).toBe(429)
+  })
+
   it('ai-reply persists a message when upstream returns content', async () => {
     const fetchImpl = vi.fn(async () => {
       return new Response(
@@ -280,6 +368,96 @@ describe('server app', () => {
     const last = upstream.getLast()
     expect(last?.url).toBe('/echo')
     expect(last?.headers.authorization).toBe('Bearer upstream_token')
+  })
+
+  it('hydrate downloads media via te_shu_cdnDownFile and updates message dataUrl', async () => {
+    const calls: Array<{ url: string; body: any }> = []
+    const fetchImpl = vi.fn(async (input: any, init?: any) => {
+      const url = typeof input === 'string' ? input : String(input?.url ?? '')
+      const body = init?.body ? JSON.parse(String(init.body)) : null
+      if (url.endsWith('/cdnDownFile')) {
+        calls.push({ url, body })
+        return new Response(JSON.stringify({ base64: 'Zm9vYmFy' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        })
+      }
+      return new Response('not found', { status: 404 })
+    }) as unknown as typeof fetch
+
+    const catalogPath = join(tmpdir(), `wkteam-catalog-${Date.now()}-cdn-down.json`)
+    await writeFile(
+      catalogPath,
+      JSON.stringify({
+        generatedAt: 0,
+        catalog: [{ kind: 'endpoint', operationId: 'te_shu_cdnDownFile', method: 'POST', path: '/cdnDownFile' }]
+      }),
+      'utf-8'
+    )
+
+    const s = await startTestServer({
+      fetchImpl,
+      configOverrides: {
+        WKTEAM_CATALOG_PATH: catalogPath,
+        UPSTREAM_BASE_URL: 'http://upstream.test',
+        UPSTREAM_AUTHORIZATION: 'Bearer upstream_token',
+        UPSTREAM_AUTH_HEADER_NAME: 'Authorization'
+      }
+    })
+    cleanup = async () => {
+      await s.close()
+      await rm(catalogPath, { force: true })
+    }
+
+    const payload = {
+      wcId: 'wxid_bot_001',
+      messageType: '60002',
+      data: {
+        wId: 'wid_001',
+        fromUser: 'wxid_peer_123',
+        toUser: 'wxid_bot_001',
+        newMsgId: 9401,
+        timestamp: 1700000400,
+        cdnUrl: 'https://cdn.example.com/a.jpg',
+        aeskey: 'aes_key_123',
+        self: false
+      }
+    }
+
+    const resp = await fetch(`${s.baseUrl}/webhooks/wkteam/callback?secret=${encodeURIComponent(s.webhookHeader['x-webhook-secret'])}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload)
+    })
+    expect(resp.status).toBe(200)
+
+    const conversationId = 'wk:wid_001:u:wxid_peer_123'
+    const list = await fetch(`${s.baseUrl}/api/conversations/${encodeURIComponent(conversationId)}/messages`, {
+      headers: s.authHeader
+    })
+    expect(list.status).toBe(200)
+    const listJson = await list.json()
+    const img = (listJson.messages as any[]).find((m) => m.kind === 'image')
+    expect(img).toBeTruthy()
+    expect(String(img.image?.dataUrl || '')).toContain('https://')
+
+    const hydrate = await fetch(`${s.baseUrl}/api/messages/${encodeURIComponent(img.id)}/hydrate`, {
+      method: 'POST',
+      headers: s.authHeader
+    })
+    expect(hydrate.status).toBe(200)
+    const hydrateJson = await hydrate.json()
+    expect(hydrateJson.ok).toBe(true)
+    expect(String(hydrateJson.message?.image?.dataUrl || '').startsWith('data:image/jpeg;base64,')).toBe(true)
+
+    expect(calls.length).toBe(1)
+    expect(new URL(calls[0]!.url).pathname).toBe('/cdnDownFile')
+    expect(calls[0]!.body).toMatchObject({
+      wId: 'wid_001',
+      cdnUrl: 'https://cdn.example.com/a.jpg',
+      aeskey: 'aes_key_123',
+      fileType: 'image'
+    })
   })
 
   it('wkteam callback webhook accepts optimized payload, supports query secret, and dedupes by newMsgId', async () => {
@@ -420,5 +598,280 @@ describe('server app', () => {
       wcId: 'wxid_peer_123',
       content: 'AI 自动回复'
     })
+  })
+
+  it('wkteam callback stores image/file messages with raw', async () => {
+    const s = await startTestServer()
+    cleanup = s.close
+
+    const imgPayload = {
+      wcId: 'wxid_bot_001',
+      messageType: '60002',
+      data: {
+        wId: 'wid_001',
+        fromUser: 'wxid_peer_123',
+        toUser: 'wxid_bot_001',
+        newMsgId: 9101,
+        timestamp: 1700000100,
+        url: 'https://example.com/pic.jpg',
+        fileName: 'pic.jpg',
+        self: false
+      }
+    }
+
+    const imgResp = await fetch(
+      `${s.baseUrl}/webhooks/wkteam/callback?secret=${encodeURIComponent(s.webhookHeader['x-webhook-secret'])}`,
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(imgPayload) }
+    )
+    expect(imgResp.status).toBe(200)
+
+    const filePayload = {
+      wcId: 'wxid_bot_001',
+      messageType: '60008',
+      data: {
+        wId: 'wid_001',
+        fromUser: 'wxid_peer_123',
+        toUser: 'wxid_bot_001',
+        newMsgId: 9102,
+        timestamp: 1700000101,
+        url: 'https://example.com/a.pdf',
+        fileName: 'a.pdf',
+        self: false
+      }
+    }
+
+    const fileResp = await fetch(
+      `${s.baseUrl}/webhooks/wkteam/callback?secret=${encodeURIComponent(s.webhookHeader['x-webhook-secret'])}`,
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(filePayload) }
+    )
+    expect(fileResp.status).toBe(200)
+
+    const cid = 'wk:wid_001:u:wxid_peer_123'
+    const list = await fetch(`${s.baseUrl}/api/conversations/${encodeURIComponent(cid)}/messages?limit=10`, {
+      headers: s.authHeader
+    })
+    expect(list.status).toBe(200)
+    const listJson = await list.json()
+    const msgs = listJson.messages as any[]
+    expect(msgs.some((m) => m.kind === 'image')).toBe(true)
+    expect(msgs.some((m) => m.kind === 'file')).toBe(true)
+
+    const img = msgs.find((m) => m.kind === 'image')
+    expect(img.raw).toContain('"messageType":"60002"')
+    expect(img.rawTruncated).toBe(false)
+    expect(img.image?.dataUrl).toBe('https://example.com/pic.jpg')
+
+    const f = msgs.find((m) => m.kind === 'file')
+    expect(f.raw).toContain('"messageType":"60008"')
+    expect(f.rawTruncated).toBe(false)
+    expect(f.file?.dataUrl).toBe('https://example.com/a.pdf')
+    expect(f.file?.name).toBe('a.pdf')
+  })
+
+  it('wkteam callback automation echoes image via uploadCdnImage + sendImage2', async () => {
+    const calls: Array<{ url: string; body: any }> = []
+    const fetchImpl = vi.fn(async (input: any, init?: any) => {
+      const url = typeof input === 'string' ? input : String(input?.url ?? '')
+      const body = init?.body ? JSON.parse(String(init.body)) : null
+      calls.push({ url, body })
+
+      if (url.endsWith('/uploadCdnImage')) {
+        return new Response(JSON.stringify({ cdnUrl: 'https://cdn.example.com/pic.jpg' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        })
+      }
+      if (url.endsWith('/sendImage2')) {
+        return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+
+      return new Response('not found', { status: 404 })
+    }) as unknown as typeof fetch
+
+    const catalogPath = join(tmpdir(), `wkteam-catalog-${Date.now()}-image.json`)
+    await writeFile(
+      catalogPath,
+      JSON.stringify({
+        generatedAt: 0,
+        catalog: [
+          { kind: 'endpoint', operationId: 'te_shu_uploadCdnImage', method: 'POST', path: '/uploadCdnImage' },
+          { kind: 'endpoint', operationId: 'xiao_xi_fa_song_fa_song_tu_pian_xiao_xi2', method: 'POST', path: '/sendImage2' }
+        ]
+      }),
+      'utf-8'
+    )
+
+    const s = await startTestServer({
+      fetchImpl,
+      configOverrides: {
+        WKTEAM_CATALOG_PATH: catalogPath,
+        UPSTREAM_BASE_URL: 'http://upstream.test',
+        UPSTREAM_AUTHORIZATION: 'Bearer upstream_token',
+        UPSTREAM_AUTH_HEADER_NAME: 'Authorization'
+      }
+    })
+    cleanup = async () => {
+      await s.close()
+      await rm(catalogPath, { force: true })
+    }
+
+    const toggle = await fetch(`${s.baseUrl}/api/automation/status`, {
+      method: 'POST',
+      headers: { ...s.authHeader, 'content-type': 'application/json' },
+      body: JSON.stringify({ automationEnabled: true })
+    })
+    expect(toggle.status).toBe(200)
+
+    const payload = {
+      wcId: 'wxid_bot_001',
+      messageType: '60002',
+      data: {
+        wId: 'wid_001',
+        fromUser: 'wxid_peer_123',
+        toUser: 'wxid_bot_001',
+        newMsgId: 9201,
+        timestamp: 1700000200,
+        url: 'https://example.com/pic.jpg',
+        self: false
+      }
+    }
+
+    const resp = await fetch(`${s.baseUrl}/webhooks/wkteam/callback?secret=${encodeURIComponent(s.webhookHeader['x-webhook-secret'])}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload)
+    })
+    expect(resp.status).toBe(200)
+
+    await (s as any).drainAutomation()
+
+    expect(calls.map((c) => new URL(c.url).pathname)).toEqual(['/uploadCdnImage', '/sendImage2'])
+    expect(calls[0]?.body).toMatchObject({ wId: 'wid_001', content: 'https://example.com/pic.jpg' })
+    expect(calls[1]?.body).toMatchObject({ wId: 'wid_001', wcId: 'wxid_peer_123', content: 'https://cdn.example.com/pic.jpg' })
+  })
+
+  it('wkteam callback automation echoes file via sendFileBase64 for dataUrl', async () => {
+    const calls: Array<{ url: string; body: any }> = []
+    const fetchImpl = vi.fn(async (input: any, init?: any) => {
+      const url = typeof input === 'string' ? input : String(input?.url ?? '')
+      const body = init?.body ? JSON.parse(String(init.body)) : null
+      calls.push({ url, body })
+      if (url.endsWith('/sendFileBase64')) {
+        return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response('not found', { status: 404 })
+    }) as unknown as typeof fetch
+
+    const catalogPath = join(tmpdir(), `wkteam-catalog-${Date.now()}-file-b64.json`)
+    await writeFile(
+      catalogPath,
+      JSON.stringify({
+        generatedAt: 0,
+        catalog: [
+          { kind: 'endpoint', operationId: 'xiao_xi_fa_song_sendFileBase64', method: 'POST', path: '/sendFileBase64' }
+        ]
+      }),
+      'utf-8'
+    )
+
+    const s = await startTestServer({
+      fetchImpl,
+      configOverrides: {
+        WKTEAM_CATALOG_PATH: catalogPath,
+        UPSTREAM_BASE_URL: 'http://upstream.test',
+        UPSTREAM_AUTHORIZATION: 'Bearer upstream_token',
+        UPSTREAM_AUTH_HEADER_NAME: 'Authorization'
+      }
+    })
+    cleanup = async () => {
+      await s.close()
+      await rm(catalogPath, { force: true })
+    }
+
+    const toggle = await fetch(`${s.baseUrl}/api/automation/status`, {
+      method: 'POST',
+      headers: { ...s.authHeader, 'content-type': 'application/json' },
+      body: JSON.stringify({ automationEnabled: true })
+    })
+    expect(toggle.status).toBe(200)
+
+    const payload = {
+      wcId: 'wxid_bot_001',
+      messageType: '60008',
+      data: {
+        wId: 'wid_001',
+        fromUser: 'wxid_peer_123',
+        toUser: 'wxid_bot_001',
+        newMsgId: 9301,
+        timestamp: 1700000300,
+        fileName: 'a.pdf',
+        content: 'data:application/pdf;base64,Zm9vYmFy',
+        self: false
+      }
+    }
+
+    const resp = await fetch(`${s.baseUrl}/webhooks/wkteam/callback?secret=${encodeURIComponent(s.webhookHeader['x-webhook-secret'])}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload)
+    })
+    expect(resp.status).toBe(200)
+
+    await (s as any).drainAutomation()
+
+    expect(calls.map((c) => new URL(c.url).pathname)).toEqual(['/sendFileBase64'])
+    expect(calls[0]?.body).toMatchObject({ wId: 'wid_001', wcId: 'wxid_peer_123', fileName: 'a.pdf', base64: 'Zm9vYmFy' })
+  })
+
+  it('sse emits message.created when a new message is persisted', async () => {
+    const s = await startTestServer()
+    cleanup = s.close
+
+    const created = await fetch(`${s.baseUrl}/api/conversations`, {
+      method: 'POST',
+      headers: { ...s.authHeader, 'content-type': 'application/json' },
+      body: JSON.stringify({ title: '测试会话', peerId: 'u_001' })
+    })
+    const createdJson = await created.json()
+    const cid = createdJson.conversation.id as string
+
+    const sse = await fetch(`${s.baseUrl}/api/events?token=${encodeURIComponent('test_token_1234567890')}`, {
+      headers: { accept: 'text/event-stream' }
+    })
+    expect(sse.status).toBe(200)
+    expect(sse.headers.get('content-type') || '').toContain('text/event-stream')
+    expect(sse.body).toBeTruthy()
+
+    const reader = sse.body!.getReader()
+    const decoder = new TextDecoder()
+    let buf = ''
+
+    const sent = await fetch(`${s.baseUrl}/api/conversations/${encodeURIComponent(cid)}/messages`, {
+      method: 'POST',
+      headers: { ...s.authHeader, 'content-type': 'application/json' },
+      body: JSON.stringify({ kind: 'text', text: 'hello sse' })
+    })
+    expect(sent.status).toBe(200)
+
+    const deadline = Date.now() + 2000
+    while (Date.now() < deadline) {
+      const { value, done } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      if (buf.includes('event: message.created') && buf.includes('\n\ndata:')) break
+      if (buf.includes('data:') && buf.includes('\n\n')) break
+    }
+    await reader.cancel().catch(() => {})
+
+    const dataLine = buf
+      .split('\n')
+      .map((l) => l.trimEnd())
+      .find((l) => l.startsWith('data:'))
+    expect(dataLine).toBeTruthy()
+
+    const json = JSON.parse((dataLine || '').replace(/^data:\s*/, ''))
+    expect(json.conversationId).toBe(cid)
+    expect(json.kind).toBe('text')
+    expect(typeof json.messageId).toBe('string')
   })
 })

@@ -9,6 +9,8 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
+    "e2e:install": "playwright install chromium",
+    "e2e": "pnpm run build && playwright test",
     "server:dev": "tsx watch src/server/index.ts",
     "server:build": "tsc -p tsconfig.server.json",
     "server:start": "node dist-server/index.js"
@@ -20,6 +22,7 @@
     "zod": "^4.1.5"
   },
   "devDependencies": {
+    "@playwright/test": "^1.58.2",
     "@testing-library/jest-dom": "^6.8.0",
     "@testing-library/react": "^16.3.0",
     "@testing-library/user-event": "^14.6.1",
@@ -28,9 +31,9 @@
     "@types/react-dom": "^19.1.9",
     "@vitejs/plugin-react": "^5.0.2",
     "jsdom": "^26.1.0",
+    "tsx": "^4.20.5",
     "typescript": "^5.9.2",
     "vite": "^7.1.4",
-    "vitest": "^3.2.4",
-    "tsx": "^4.20.5"
+    "vitest": "^3.2.4"
   }
 }

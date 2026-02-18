@@ -12,6 +12,23 @@ import {
   setRememberAuthorization
 } from '../../sdk/configStorage'
 import { fileToDataUrl } from '../../utils/file'
+
+// Utility to strip data: prefix from dataUrl to get pure base64
+function stripDataUrl(dataUrl: string): string {
+  const match = /^data:[^;]+;base64,(.*)$/i.exec(dataUrl)
+  return match?.[1] ?? dataUrl
+}
+
+// Check if a string looks like base64 (simple validation)
+function looksLikeBase64(str: string): boolean {
+  const base64Regex = /^[A-Za-z0-9+/]*={0,2}$/
+  // Remove whitespace for validation
+  const clean = str.replace(/\s/g, '')
+  if (clean.length === 0) return false
+  // If it looks like a data URL, it's not pure base64
+  if (clean.startsWith('data:')) return false
+  return base64Regex.test(clean)
+}
 import { useAppActions } from '../../state/hooks'
 import { useConnectionState } from '../../remote/ConnectionProvider'
 
@@ -38,6 +55,10 @@ export function SdkConsolePane() {
 
   const fileRef = useRef<HTMLInputElement | null>(null)
   const [fileTargetParam, setFileTargetParam] = useState<string | null>(null)
+  // Toggle for dataUrl -> base64 conversion (default: on for better UX)
+  const [stripDataUrlPrefix, setStripDataUrlPrefix] = useState<boolean>(true)
+  // Validation errors for base64 fields
+  const [base64ValidationErrors, setBase64ValidationErrors] = useState<Record<string, string>>({})
 
   useEffect(() => {
     let mounted = true
@@ -266,22 +287,48 @@ export function SdkConsolePane() {
           <div className={styles.card}>
             <div className={styles.sectionTitle}>参数</div>
             {selected.params.length === 0 ? <div className={styles.small}>无参数</div> : null}
+            {/* Global toggle for dataUrl->base64 stripping */}
+            <label className={styles.checkboxRow}>
+              <input
+                type="checkbox"
+                checked={stripDataUrlPrefix}
+                onChange={(e) => setStripDataUrlPrefix(e.target.checked)}
+              />
+              自动去掉 data:...;base64, 前缀（sendFileBase64 等需要纯 base64 时建议开启）
+            </label>
             {selected.params.map((p) => {
               const isFileLike = /file|image|base64/i.test(p.name)
+              const isBase64Like = /base64/i.test(p.name)
+              const val = params[p.name] ?? ''
+              const hasError = base64ValidationErrors[p.name]
               return (
                 <div key={p.name} className={styles.paramRow}>
                   <div className={styles.paramName}>
                     {p.name}
                     {p.required ? <span className={styles.req}>*</span> : null}
                     <div className={styles.paramDesc}>{p.desc}</div>
+                    {isBase64Like && hasError ? (
+                      <div className={styles.errorText}>{hasError}</div>
+                    ) : null}
                   </div>
                   <div className={styles.paramInput}>
                     <input
-                      className={styles.input}
+                      className={hasError ? `${styles.input} ${styles.inputError}` : styles.input}
                       aria-label={`参数 ${p.name}`}
-                      value={params[p.name] ?? ''}
+                      value={val}
                       placeholder={p.type || 'String'}
-                      onChange={(e) => setParams({ ...params, [p.name]: e.target.value })}
+                      onChange={(e) => {
+                        const v = e.target.value
+                        setParams({ ...params, [p.name]: v })
+                        // Clear validation error on change
+                        if (base64ValidationErrors[p.name]) {
+                          setBase64ValidationErrors((prev) => {
+                            const next = { ...prev }
+                            delete next[p.name]
+                            return next
+                          })
+                        }
+                      }}
                     />
                     {isFileLike ? (
                       <button
@@ -308,11 +355,38 @@ export function SdkConsolePane() {
                 disabled={running}
                 onClick={async () => {
                   setRunning(true)
+                  // Clear previous validation errors
+                  setBase64ValidationErrors({})
                   try {
                     const payload: Record<string, unknown> = {}
+                    const validationErrors: Record<string, string> = {}
                     for (const [k, v] of Object.entries(params)) {
                       if (v === '') continue
-                      payload[k] = v
+
+                      // Check if this is a base64-like field
+                      const isBase64Like = /base64/i.test(k)
+                      if (isBase64Like) {
+                        // Validate: either dataUrl or pure base64
+                        const looksValid = v.startsWith('data:') || looksLikeBase64(v)
+                        if (!looksValid) {
+                          validationErrors[k] = '无效的 base64 格式（应为 data:...;base64,xx 或纯 base64）'
+                        }
+                        // Strip dataUrl prefix if toggle is on and it's a dataUrl
+                        if (stripDataUrlPrefix && v.startsWith('data:')) {
+                          payload[k] = stripDataUrl(v)
+                        } else {
+                          payload[k] = v
+                        }
+                      } else {
+                        payload[k] = v
+                      }
+                    }
+
+                    // Show validation errors if any
+                    if (Object.keys(validationErrors).length > 0) {
+                      setBase64ValidationErrors(validationErrors)
+                      actions.pushToast({ kind: 'error', title: '参数校验失败', detail: '请检查 base64 字段格式。' })
+                      return
                     }
 
                     if (execMode === 'bff_proxy') {

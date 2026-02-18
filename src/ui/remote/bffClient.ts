@@ -63,6 +63,7 @@ export type BffClient = {
   getAutomationStatus: () => Promise<boolean>
   setAutomationStatus: (automationEnabled: boolean) => Promise<boolean>
   callUpstream: (operationId: string, params: Record<string, unknown>) => Promise<unknown>
+  hydrateMessage: (messageId: string) => Promise<BffMessage>
 }
 
 const errorSchema = z.object({
@@ -209,6 +210,13 @@ export function createBffClient(opts: { baseUrl: string; token: string }): BffCl
         body: JSON.stringify({ operationId, params: params ?? {} })
       })
       return json.data
+    },
+    async hydrateMessage(messageId: string) {
+      const json = await callJson<{ message: BffMessage }>(`/api/messages/${encodeURIComponent(messageId)}/hydrate`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' }
+      })
+      return json.message
     }
   }
 }
