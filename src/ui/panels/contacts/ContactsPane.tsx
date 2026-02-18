@@ -12,6 +12,10 @@ export function ContactsPane() {
   const state = useAppState()
   const actions = useAppActions()
 
+  const friends = state.persisted.contacts.filter((c) => c.id.startsWith('c_'))
+  const groups = state.persisted.contacts.filter((c) => c.id.startsWith('g_'))
+  const others = state.persisted.contacts.filter((c) => !c.id.startsWith('c_') && !c.id.startsWith('g_'))
+
   const selectedContact =
     state.persisted.selectedContactId == null
       ? null
@@ -20,11 +24,27 @@ export function ContactsPane() {
   const list = (
     <>
       <PaneHeader title="通讯录" />
-      <ContactList
-        contacts={state.persisted.contacts}
-        selectedContactId={state.persisted.selectedContactId}
-        onSelect={actions.selectContact}
-      />
+      <div className={styles.scroll} aria-label="通讯录滚动区">
+        <div className={styles.section}>
+          <div className={styles.sectionTitle}>好友</div>
+          <ContactList
+            contacts={[...friends, ...others]}
+            ariaLabel="好友列表"
+            selectedContactId={state.persisted.selectedContactId}
+            onSelect={actions.selectContact}
+          />
+        </div>
+
+        <div className={styles.section}>
+          <div className={styles.sectionTitle}>群聊</div>
+          <ContactList
+            contacts={groups}
+            ariaLabel="群聊列表"
+            selectedContactId={state.persisted.selectedContactId}
+            onSelect={actions.selectContact}
+          />
+        </div>
+      </div>
     </>
   )
 
@@ -39,4 +59,3 @@ export function ContactsPane() {
 
   return <TwoPaneLayout list={list} content={content} />
 }
-

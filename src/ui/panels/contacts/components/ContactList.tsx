@@ -8,14 +8,16 @@ import type { Contact } from '../../../state/types'
  * @param props.contacts 联系人数组
  * @param props.selectedContactId 当前选中联系人 id
  * @param props.onSelect 选择联系人回调
+ * @param props.ariaLabel 列表 aria-label（便于测试与可访问性）
  */
 export function ContactList(props: {
   contacts: Contact[]
   selectedContactId: string | null
   onSelect: (id: string) => void
+  ariaLabel?: string
 }) {
   return (
-    <div className={styles.root} role="list" aria-label="联系人列表">
+    <div className={styles.root} role="list" aria-label={props.ariaLabel ?? '联系人列表'}>
       {props.contacts.map((c) => {
         const isActive = c.id === props.selectedContactId
         return (
@@ -40,4 +42,3 @@ export function ContactList(props: {
     </div>
   )
 }
-

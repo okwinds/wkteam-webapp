@@ -68,12 +68,14 @@
 .contentTitle {
   font-weight: 900;
   font-size: 18px;
+  margin: 0;
 }
 
 .contentDesc {
   margin-top: var(--space-2);
   color: var(--text-secondary);
   line-height: 1.6;
+  margin-bottom: 0;
 }
 
 .hint {
@@ -82,4 +84,3 @@
   font-size: 12px;
   line-height: 1.6;
 }
-

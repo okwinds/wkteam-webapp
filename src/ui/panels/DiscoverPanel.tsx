@@ -1,28 +1,27 @@
-import { Compass, Heart, NotebookText, ScanEye } from 'lucide-react'
+import { Compass, Heart, NotebookText, ScanEye, Video } from 'lucide-react'
 import { TwoPaneLayout } from './shared/TwoPaneLayout'
 import { PaneHeader } from './shared/PaneHeader'
 import styles from './DiscoverPanel.module.css'
 import { useState } from 'react'
 import type { ComponentType } from 'react'
-import { useAppActions } from '../state/hooks'
 import { SdkConsolePane } from './sdk/SdkConsolePane'
 
-type EntryKey = 'moments' | 'read' | 'scan' | 'favorites' | 'sdk_console'
+type EntryKey = 'moments' | 'read' | 'scan' | 'favorites' | 'video' | 'sdk_console'
 
 /**
  * Discover 面板（发现）
  *
- * - V1 定位：入口列表占位，不进入未定义页面
+ * - 定位：入口列表 + 右栏内容；长尾功能以“轻量占位内容”逐步补齐
  */
 export function DiscoverPanel() {
-  const actions = useAppActions()
   const [selected, setSelected] = useState<EntryKey>('moments')
 
   const entries: Array<{ key: EntryKey; title: string; desc: string; Icon: ComponentType<{ size?: number }> }> = [
-    { key: 'moments', title: '朋友圈（占位）', desc: 'V1 不实现内容流，只保留入口。', Icon: Compass },
-    { key: 'read', title: '看一看（占位）', desc: 'V1 仅展示说明与点击提示。', Icon: NotebookText },
-    { key: 'scan', title: '扫一扫（占位）', desc: 'V1 不接相机能力。', Icon: ScanEye },
-    { key: 'favorites', title: '收藏（占位）', desc: 'V1 不实现收藏管理。', Icon: Heart },
+    { key: 'moments', title: '朋友圈', desc: '本地示例内容（先把 UI 跑起来）。', Icon: Compass },
+    { key: 'video', title: '视频号', desc: '本地示例内容（不接真实视频流）。', Icon: Video },
+    { key: 'read', title: '看一看', desc: '轻量占位：仅展示说明。', Icon: NotebookText },
+    { key: 'scan', title: '扫一扫', desc: '轻量占位：不接相机能力。', Icon: ScanEye },
+    { key: 'favorites', title: '收藏', desc: '轻量占位：后续可从聊天消息收藏。', Icon: Heart },
     { key: 'sdk_console', title: 'SDK 控制台', desc: '全量 endpoint 执行能力（开发者工具）。', Icon: NotebookText }
   ]
 
@@ -40,16 +39,10 @@ export function DiscoverPanel() {
               className={active ? `${styles.item} ${styles.active}` : styles.item}
               onClick={() => {
                 setSelected(e.key)
-                if (e.key !== 'sdk_console') {
-                  actions.pushToast({ kind: 'info', title: 'V1 未实现', detail: '该入口仅用于确认 UI 结构。' })
-                }
               }}
               onKeyDown={(ev) => {
                 if (ev.key === 'Enter') {
                   setSelected(e.key)
-                  if (e.key !== 'sdk_console') {
-                    actions.pushToast({ kind: 'info', title: 'V1 未实现', detail: '该入口仅用于确认 UI 结构。' })
-                  }
                 }
               }}
             >
@@ -75,9 +68,23 @@ export function DiscoverPanel() {
     ) : (
       <div className={styles.content}>
         <div className={styles.contentCard}>
-          <div className={styles.contentTitle}>{current.title}</div>
-          <div className={styles.contentDesc}>{current.desc}</div>
-          <div className={styles.hint}>提示：V1 不跳转页面。点击入口仅用于确认整体 UI 结构与风格。</div>
+          <h2 className={styles.contentTitle}>{current.title}</h2>
+          <p className={styles.contentDesc}>{current.desc}</p>
+          {selected === 'moments' ? (
+            <div className={styles.hint}>
+              示例：
+              <br />
+              - 今天的目标：把“长尾入口”先做全，再逐步补内容。
+              <br />
+              - 约束：离线可用、不引入复杂依赖。
+            </div>
+          ) : selected === 'favorites' ? (
+            <div className={styles.hint}>提示：后续可以在聊天消息上提供“收藏”动作，把引用存到本地。</div>
+          ) : selected === 'video' ? (
+            <div className={styles.hint}>提示：本版本不接真实视频；先保留入口与内容区骨架。</div>
+          ) : (
+            <div className={styles.hint}>提示：该入口为轻量占位内容，后续按需补齐。</div>
+          )}
         </div>
       </div>
     )

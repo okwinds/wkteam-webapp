@@ -22,7 +22,11 @@ export function createSeedPersistedState(nowMs: number): PersistedStateV2 {
     { id: 'c_eli', displayName: '伊莱', avatarSeed: 'eli', signature: '保持节奏' },
     { id: 'c_faye', displayName: '菲', avatarSeed: 'faye', signature: '少即是多' },
     { id: 'c_gus', displayName: '古斯', avatarSeed: 'gus', signature: '稳定可回归' },
-    { id: 'c_hana', displayName: '花', avatarSeed: 'hana', signature: '清爽的 UI' }
+    { id: 'c_hana', displayName: '花', avatarSeed: 'hana', signature: '清爽的 UI' },
+
+    // 群聊（长尾入口：先补齐 UI 骨架；聊天行为先复用 DM 会话逻辑）
+    { id: 'g_team', displayName: '项目群', avatarSeed: 'team', signature: '先把能力做全' },
+    { id: 'g_family', displayName: '家人群', avatarSeed: 'family', signature: '保持联系' }
   ]
 
   const mkConversationId = (contactId: string) => `dm:${contactId}`
