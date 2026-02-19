@@ -57,7 +57,7 @@ export type Message = TextMessage | ImageMessage | FileMessage
 
 export type AutomationRun = {
   id: string
-  trigger: 'manual' | 'webhook'
+  trigger: 'manual' | 'webhook' | 'human_send'
   conversationId: string
   inputMessageId: string
   outputMessageId: string | null
@@ -135,7 +135,7 @@ const dbSchemaV1 = z.object({
   automationRuns: z.array(
     z.object({
       id: z.string(),
-      trigger: z.union([z.literal('manual'), z.literal('webhook')]),
+      trigger: z.union([z.literal('manual'), z.literal('webhook'), z.literal('human_send')]),
       conversationId: z.string(),
       inputMessageId: z.string(),
       outputMessageId: z.string().nullable(),

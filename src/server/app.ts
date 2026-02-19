@@ -150,6 +150,18 @@ export async function createAppServer(
     }
   }
 
+  const emitConversationChanged = (conversationId: string, action: 'created' | 'updated' | 'deleted') => {
+    if (sseClients.size === 0) return
+    const payload = { conversationId, action, ts: deps.nowMs() }
+    for (const client of sseClients) {
+      try {
+        writeSse(client, 'conversation.changed', payload)
+      } catch {
+        sseClients.delete(client)
+      }
+    }
+  }
+
   let automationQueue: Promise<void> = Promise.resolve()
   const enqueueAutomation = (fn: () => Promise<void>) => {
     const run = automationQueue.then(fn)
@@ -171,6 +183,11 @@ export async function createAppServer(
     const m = /^wk:([^:]+):(u|g):(.+)$/.exec(conversationId)
     if (!m) return null
     return { wId: m[1], peerKind: m[2] as 'u' | 'g', peerId: m[3] }
+  }
+
+  const isValidWkConversationId = (conversationId: string) => {
+    if (conversationId.length > 120) return false
+    return parseWkConversationId(conversationId) != null
   }
 
   const pickStringByKeyAliases = (root: unknown, keys: string[]) => {
@@ -438,7 +455,8 @@ export async function createAppServer(
       const parsed = z
         .object({
           title: z.string().min(1).max(40),
-          peerId: z.string().min(1).max(80)
+          peerId: z.string().min(1).max(80),
+          conversationId: z.string().min(1).max(120).optional()
         })
         .safeParse(body.value)
       if (!parsed.success) {
@@ -446,9 +464,29 @@ export async function createAppServer(
         return
       }
 
+      const requestedConversationId = parsed.data.conversationId?.trim() ?? null
+      if (requestedConversationId && !isValidWkConversationId(requestedConversationId)) {
+        writeJson(res, 400, { error: { code: 'BAD_REQUEST', message: 'invalid conversationId' } })
+        return
+      }
+
+      const requestedWk = requestedConversationId ? parseWkConversationId(requestedConversationId) : null
+      if (requestedWk && requestedWk.peerId !== parsed.data.peerId) {
+        writeJson(res, 400, { error: { code: 'BAD_REQUEST', message: 'peerId not match conversationId' } })
+        return
+      }
+
+      if (requestedConversationId) {
+        const existed = dbState.conversations.find((c) => c.id === requestedConversationId)
+        if (existed) {
+          writeJson(res, 200, { conversation: existed })
+          return
+        }
+      }
+
       const now = deps.nowMs()
       const conversation: Conversation = {
-        id: makeId('c', now),
+        id: requestedConversationId ?? makeId('c', now),
         title: parsed.data.title,
         peerId: parsed.data.peerId,
         pinned: false,
@@ -460,6 +498,7 @@ export async function createAppServer(
       }
       dbState.conversations = [conversation, ...dbState.conversations]
       await persist()
+      emitConversationChanged(conversation.id, 'created')
       writeJson(res, 200, { conversation })
       return
     }
@@ -475,6 +514,7 @@ export async function createAppServer(
       dbState.conversations = dbState.conversations.filter((c) => c.id !== id)
       dbState.messages = dbState.messages.filter((m) => m.conversationId !== id)
       await persist()
+      emitConversationChanged(id, 'deleted')
       writeJson(res, 200, { ok: true })
       return
     }
@@ -499,6 +539,7 @@ export async function createAppServer(
       }
       dbState.conversations = dbState.conversations.map((c) => (c.id === id ? { ...c, pinned: parsed.data.pinned } : c))
       await persist()
+      emitConversationChanged(id, 'updated')
       writeJson(res, 200, { ok: true, pinned: parsed.data.pinned })
       return
     }
@@ -606,6 +647,98 @@ export async function createAppServer(
       })
       await persist()
       emitMessageCreated(message)
+
+      const wkInfo = message.kind === 'text' ? parseWkConversationId(conversationId) : null
+      if (message.kind === 'text' && wkInfo) {
+        const upstreamBaseUrl = deps.config.UPSTREAM_BASE_URL.trim().replace(/\/$/, '')
+        const upstreamAuth = deps.config.UPSTREAM_AUTHORIZATION.trim()
+        if (wkteamCatalog && upstreamBaseUrl && upstreamAuth) {
+          const inputMessageId = message.id
+          const content = message.text
+          void enqueueAutomation(async () => {
+            const runId = makeId('run', deps.nowMs())
+            const startedAt = deps.nowMs()
+            const sendTextEp = wkteamCatalog.get('xiao_xi_fa_song_fa_song_wen_ben_xiao_xi')
+            if (!sendTextEp) {
+              dbState.automationRuns.push({
+                id: runId,
+                trigger: 'human_send',
+                conversationId,
+                inputMessageId,
+                outputMessageId: inputMessageId,
+                status: 'failed',
+                startedAt,
+                endedAt: deps.nowMs(),
+                error: { code: 'UNKNOWN_OPERATION_ID', message: 'sendText operationId not found in catalog' }
+              })
+              await persist()
+              return
+            }
+            const controller = new AbortController()
+            const t = setTimeout(() => controller.abort(), deps.config.UPSTREAM_TIMEOUT_MS)
+            try {
+              const resp = await deps.fetchImpl(`${upstreamBaseUrl}${sendTextEp.path}`, {
+                method: sendTextEp.method,
+                headers: {
+                  'content-type': 'application/json',
+                  [deps.config.UPSTREAM_AUTH_HEADER_NAME]: upstreamAuth
+                },
+                body: JSON.stringify({ wId: wkInfo.wId, wcId: wkInfo.peerId, content }),
+                signal: controller.signal
+              })
+              const text = await resp.text().catch(() => '')
+
+              dbState.automationRuns.push(
+                resp.ok
+                  ? {
+                      id: runId,
+                      trigger: 'human_send',
+                      conversationId,
+                      inputMessageId,
+                      outputMessageId: inputMessageId,
+                      status: 'success',
+                      startedAt,
+                      endedAt: deps.nowMs()
+                    }
+                  : {
+                      id: runId,
+                      trigger: 'human_send',
+                      conversationId,
+                      inputMessageId,
+                      outputMessageId: inputMessageId,
+                      status: 'failed',
+                      startedAt,
+                      endedAt: deps.nowMs(),
+                      error: {
+                        code: 'UPSTREAM_HTTP_ERROR',
+                        message: `upstream http ${resp.status}: ${text}`.slice(0, 200)
+                      }
+                    }
+              )
+            } catch (e) {
+              const isAbortError =
+                typeof DOMException !== 'undefined' && e instanceof DOMException && e.name === 'AbortError'
+              dbState.automationRuns.push({
+                id: runId,
+                trigger: 'human_send',
+                conversationId,
+                inputMessageId,
+                outputMessageId: inputMessageId,
+                status: 'failed',
+                startedAt,
+                endedAt: deps.nowMs(),
+                error: {
+                  code: isAbortError ? 'UPSTREAM_TIMEOUT' : 'UPSTREAM_NETWORK_ERROR',
+                  message: (e instanceof Error ? e.message : 'UPSTREAM_UNKNOWN_ERROR').slice(0, 200)
+                }
+              })
+            } finally {
+              clearTimeout(t)
+              await persist()
+            }
+          })
+        }
+      }
       writeJson(res, 200, { message })
       return
     }
@@ -740,6 +873,16 @@ export async function createAppServer(
 
     if (method === 'GET' && pathname === '/api/automation/status') {
       writeJson(res, 200, { automationEnabled: dbState.automationEnabled })
+      return
+    }
+
+    if (method === 'GET' && pathname === '/api/automation/runs') {
+      const limitRaw = url.searchParams.get('limit')
+      const limitParsed = limitRaw == null ? 50 : Number(limitRaw)
+      const safeLimit = Number.isFinite(limitParsed) ? Math.trunc(limitParsed) : 50
+      const limit = Math.max(1, Math.min(200, safeLimit))
+      const runs = [...dbState.automationRuns].sort((a, b) => b.startedAt - a.startedAt).slice(0, limit)
+      writeJson(res, 200, { runs })
       return
     }
 

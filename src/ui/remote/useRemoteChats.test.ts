@@ -51,6 +51,7 @@ describe('useRemoteChats', () => {
       aiReply: vi.fn(),
       getAutomationStatus: vi.fn(),
       setAutomationStatus: vi.fn(),
+      listAutomationRuns: vi.fn().mockResolvedValue([]),
       callUpstream: vi.fn(),
       hydrateMessage: vi.fn().mockResolvedValue({
         id: 'hydrated-message',

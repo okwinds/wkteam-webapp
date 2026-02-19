@@ -1,4 +1,5 @@
 import { Plus } from 'lucide-react'
+import { useEffect } from 'react'
 import { TwoPaneLayout } from '../shared/TwoPaneLayout'
 import { PaneHeader } from '../shared/PaneHeader'
 import { useAppActions, useAppState } from '../../state/hooks'
@@ -19,9 +20,23 @@ export function ChatsPane() {
 
   const isServerMode = connection.settings.mode === 'server'
 
-  const selectedConversation = isServerMode ? remote.selectedConversation : state.persisted.selectedConversationId == null
-    ? null
-    : state.persisted.conversations.find((c) => c.id === state.persisted.selectedConversationId) ?? null
+  // Server mode: 使用 AppState 驱动选中态
+  const selectedConversationId = state.persisted.selectedConversationId
+
+  const selectedConversation = isServerMode
+    ? (selectedConversationId == null
+        ? null
+        : remote.conversations.find((c) => c.id === selectedConversationId) ?? null)
+    : (selectedConversationId == null
+        ? null
+        : state.persisted.conversations.find((c) => c.id === selectedConversationId) ?? null)
+
+  // Server mode: 当 AppState 的 selectedConversationId 变化时，同步到 remote
+  useEffect(() => {
+    if (!isServerMode) return
+    if (state.persisted.selectedConversationId == null) return
+    remote.selectConversation(state.persisted.selectedConversationId)
+  }, [isServerMode, state.persisted.selectedConversationId, remote])
 
   const list = (
     <>
@@ -62,8 +77,8 @@ export function ChatsPane() {
       <ConversationList
         conversations={isServerMode ? remote.conversations : state.persisted.conversations}
         messages={isServerMode ? (remote.messages as any) : state.persisted.messages}
-        selectedConversationId={isServerMode ? remote.selectedConversationId : state.persisted.selectedConversationId}
-        onSelect={isServerMode ? remote.selectConversation : actions.selectConversation}
+        selectedConversationId={selectedConversationId}
+        onSelect={actions.selectConversation}
         onTogglePinned={
           isServerMode
             ? (id) =>

@@ -192,6 +192,10 @@ export function useRemoteChats(client: BffClient | null): RemoteChatsModel {
       refresh()
     })
 
+    es.addEventListener('conversation.changed', () => {
+      refresh()
+    })
+
     es.onerror = () => {
       // EventSource auto-reconnects, but if it fails repeatedly we should fall back
       setSseState('error')

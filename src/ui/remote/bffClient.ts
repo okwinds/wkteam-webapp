@@ -49,13 +49,25 @@ export type BffFileMessage = {
 
 export type BffMessage = BffTextMessage | BffImageMessage | BffFileMessage
 
+export type BffAutomationRun = {
+  id: string
+  trigger: 'manual' | 'webhook' | 'human_send'
+  conversationId: string
+  inputMessageId: string
+  outputMessageId: string | null
+  status: 'running' | 'success' | 'failed'
+  startedAt: number
+  endedAt: number | null
+  error?: { code: string; message: string }
+}
+
 export type BffClient = {
   testAuth: () => Promise<'ok' | 'auth_failed' | 'error'>
   loginLocal: (password: string) => Promise<void>
   logoutLocal: () => Promise<void>
   getMe: () => Promise<boolean>
   listConversations: () => Promise<BffConversation[]>
-  createConversation: (input: { title: string; peerId: string }) => Promise<BffConversation>
+  createConversation: (input: { title: string; peerId: string; conversationId?: string }) => Promise<BffConversation>
   deleteConversation: (conversationId: string) => Promise<void>
   setPinned: (conversationId: string, pinned: boolean) => Promise<boolean>
   listMessages: (conversationId: string, limit?: number) => Promise<BffMessage[]>
@@ -65,6 +77,7 @@ export type BffClient = {
   aiReply: (conversationId: string) => Promise<BffMessage>
   getAutomationStatus: () => Promise<boolean>
   setAutomationStatus: (automationEnabled: boolean) => Promise<boolean>
+  listAutomationRuns: (limit?: number) => Promise<BffAutomationRun[]>
   callUpstream: (operationId: string, params: Record<string, unknown>) => Promise<unknown>
   hydrateMessage: (messageId: string) => Promise<BffMessage>
 }
@@ -256,6 +269,11 @@ export function createBffClient(opts: { baseUrl: string; token?: string | null }
         body: JSON.stringify({ automationEnabled })
       })
       return json.automationEnabled
+    },
+    async listAutomationRuns(limit?: number) {
+      const qs = limit ? `?limit=${encodeURIComponent(String(limit))}` : ''
+      const json = await callJson<{ runs: BffAutomationRun[] }>(`/api/automation/runs${qs}`)
+      return json.runs
     },
     async callUpstream(operationId, params) {
       const json = await callJson<{ ok: true; data: unknown }>('/api/upstream/call', {

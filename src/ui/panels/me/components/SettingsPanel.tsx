@@ -4,6 +4,7 @@ import styles from './SettingsPanel.module.css'
 import { useAppActions, useAppState } from '../../../state/hooks'
 import { ConfirmDialog } from '../../shared/ConfirmDialog'
 import { useConnectionActions, useConnectionState } from '../../../remote/ConnectionProvider'
+import type { BffAutomationRun } from '../../../remote/bffClient'
 
 /**
  * 设置面板（主题/字体/发送键/数据管理）
@@ -17,14 +18,18 @@ export function SettingsPanel() {
   const [openReset, setOpenReset] = useState(false)
   const [automationEnabled, setAutomationEnabled] = useState<boolean | null>(null)
   const [automationBusy, setAutomationBusy] = useState(false)
+  const [runs, setRuns] = useState<BffAutomationRun[] | null>(null)
+  const [runsBusy, setRunsBusy] = useState(false)
 
   useEffect(() => {
     if (connection.settings.mode !== 'server') {
       setAutomationEnabled(null)
+      setRuns(null)
       return
     }
     if (connection.status !== 'connected' || !connection.client) {
       setAutomationEnabled(null)
+      setRuns(null)
       return
     }
     connection.client
@@ -229,6 +234,51 @@ export function SettingsPanel() {
               </button>
             </div>
             <div className={styles.hint}>提示：自动化默认关闭；开启后 webhook 新消息可能触发 AI 回复。</div>
+
+            <div className={styles.row}>
+              <div className={styles.label}>最近 runs</div>
+              <button
+                type="button"
+                className={styles.btn}
+                disabled={!connection.client || connection.status !== 'connected' || runsBusy}
+                aria-label="刷新 automation runs"
+                onClick={async () => {
+                  if (!connection.client) return
+                  setRunsBusy(true)
+                  try {
+                    const list = await connection.client.listAutomationRuns(10)
+                    setRuns(list)
+                    actions.pushToast({ kind: 'info', title: '已刷新', detail: `获取到 ${list.length} 条 runs。` })
+                  } catch (e) {
+                    actions.pushToast({ kind: 'error', title: '获取失败', detail: e instanceof Error ? e.message : '未知错误' })
+                  } finally {
+                    setRunsBusy(false)
+                  }
+                }}
+              >
+                刷新
+              </button>
+            </div>
+
+            {runs && runs.length ? (
+              <div className={styles.hint} aria-label="automation runs 列表">
+                {runs.map((r) => {
+                  const endedAt = r.endedAt ?? r.startedAt
+                  const costMs = Math.max(0, endedAt - r.startedAt)
+                  const statusText =
+                    r.status === 'success' ? 'success' : r.status === 'failed' ? `failed(${r.error?.code ?? 'error'})` : 'running'
+                  const cid = r.conversationId
+                  const cidShort = cid.length > 40 ? `${cid.slice(0, 40)}…` : cid
+                  return (
+                    <div key={r.id}>
+                      {statusText} · {r.trigger} · {cidShort} · {costMs}ms
+                    </div>
+                  )
+                })}
+              </div>
+            ) : runs ? (
+              <div className={styles.hint}>暂无 runs。</div>
+            ) : null}
           </>
         ) : (
           <div className={styles.hint}>本地模式下聊天数据仅保存在浏览器 localStorage，可导入/导出。</div>

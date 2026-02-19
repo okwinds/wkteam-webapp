@@ -195,6 +195,38 @@ describe('server app', () => {
     expect(msg.message.text).toBe('hello')
   })
 
+  it('create wk conversation by conversationId and keep idempotent on second request', async () => {
+    const s = await startTestServer()
+    cleanup = s.close
+
+    const conversationId = 'wk:wid_001:u:wxid_peer_123'
+    const payload = { title: '指定 wk 会话', peerId: 'wxid_peer_123', conversationId }
+
+    const first = await fetch(`${s.baseUrl}/api/conversations`, {
+      method: 'POST',
+      headers: { ...s.authHeader, 'content-type': 'application/json' },
+      body: JSON.stringify(payload)
+    })
+    expect(first.status).toBe(200)
+    const firstJson = await first.json()
+    expect(firstJson.conversation.id).toBe(conversationId)
+
+    const second = await fetch(`${s.baseUrl}/api/conversations`, {
+      method: 'POST',
+      headers: { ...s.authHeader, 'content-type': 'application/json' },
+      body: JSON.stringify(payload)
+    })
+    expect(second.status).toBe(200)
+    const secondJson = await second.json()
+    expect(secondJson.conversation.id).toBe(conversationId)
+
+    const list = await fetch(`${s.baseUrl}/api/conversations`, { headers: s.authHeader })
+    expect(list.status).toBe(200)
+    const listJson = await list.json()
+    const rows = (listJson.conversations as any[]).filter((c) => c.id === conversationId)
+    expect(rows.length).toBe(1)
+  })
+
   it('toggle pinned and delete conversation', async () => {
     const s = await startTestServer()
     cleanup = s.close
@@ -669,6 +701,159 @@ describe('server app', () => {
       wId: 'wid_001',
       wcId: 'wxid_peer_123',
       content: 'AI 自动回复'
+    })
+  })
+
+  it('GET /api/automation/runs requires auth and returns stable runs shape', async () => {
+    const noAuthServer = await startTestServer()
+    cleanup = noAuthServer.close
+
+    const noAuth = await fetch(`${noAuthServer.baseUrl}/api/automation/runs`)
+    expect(noAuth.status).toBe(401)
+
+    await cleanup()
+    cleanup = null
+
+    const calls: Array<{ url: string; body: any }> = []
+    const fetchImpl = vi.fn(async (input: any, init?: any) => {
+      const url = typeof input === 'string' ? input : String(input?.url ?? '')
+      const body = init?.body ? JSON.parse(String(init.body)) : null
+      calls.push({ url, body })
+      if (url.endsWith('/sendText')) {
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        })
+      }
+      return new Response('not found', { status: 404 })
+    }) as unknown as typeof fetch
+
+    const catalogPath = join(tmpdir(), `wkteam-catalog-${Date.now()}-human-send-runs.json`)
+    await writeFile(
+      catalogPath,
+      JSON.stringify({
+        generatedAt: 0,
+        catalog: [
+          { kind: 'endpoint', operationId: 'xiao_xi_fa_song_fa_song_wen_ben_xiao_xi', method: 'POST', path: '/sendText' }
+        ]
+      }),
+      'utf-8'
+    )
+
+    const s = await startTestServer({
+      fetchImpl,
+      configOverrides: {
+        WKTEAM_CATALOG_PATH: catalogPath,
+        UPSTREAM_BASE_URL: 'http://upstream.test',
+        UPSTREAM_AUTHORIZATION: 'Bearer upstream_token',
+        UPSTREAM_AUTH_HEADER_NAME: 'Authorization'
+      }
+    })
+    cleanup = async () => {
+      await s.close()
+      await rm(catalogPath, { force: true })
+    }
+
+    const cid = 'wk:wid_002:u:wxid_peer_456'
+    const created = await fetch(`${s.baseUrl}/api/conversations`, {
+      method: 'POST',
+      headers: { ...s.authHeader, 'content-type': 'application/json' },
+      body: JSON.stringify({ title: 'run test', peerId: 'wxid_peer_456', conversationId: cid })
+    })
+    expect(created.status).toBe(200)
+
+    const sendText = await fetch(`${s.baseUrl}/api/conversations/${encodeURIComponent(cid)}/messages`, {
+      method: 'POST',
+      headers: { ...s.authHeader, 'content-type': 'application/json' },
+      body: JSON.stringify({ kind: 'text', text: 'hello from human' })
+    })
+    expect(sendText.status).toBe(200)
+    await (s as any).drainAutomation()
+    expect(calls.map((c) => new URL(c.url).pathname)).toEqual(['/sendText'])
+
+    const runsResp = await fetch(`${s.baseUrl}/api/automation/runs?limit=1`, { headers: s.authHeader })
+    expect(runsResp.status).toBe(200)
+    const runsJson = await runsResp.json()
+    expect(Array.isArray(runsJson.runs)).toBe(true)
+    expect(runsJson.runs.length).toBe(1)
+    expect(runsJson.runs[0]).toMatchObject({
+      trigger: 'human_send',
+      conversationId: cid,
+      status: 'success'
+    })
+    expect(typeof runsJson.runs[0].startedAt).toBe('number')
+    expect(typeof runsJson.runs[0].endedAt).toBe('number')
+  })
+
+  it('human text outbound in wk conversation enqueues upstream sendText asynchronously', async () => {
+    const calls: Array<{ url: string; body: any; at: number }> = []
+    const fetchImpl = vi.fn(async (input: any, init?: any) => {
+      const url = typeof input === 'string' ? input : String(input?.url ?? '')
+      const body = init?.body ? JSON.parse(String(init.body)) : null
+      calls.push({ url, body, at: Date.now() })
+      await new Promise((r) => setTimeout(r, 200))
+      if (url.endsWith('/sendText')) {
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        })
+      }
+      return new Response('not found', { status: 404 })
+    }) as unknown as typeof fetch
+
+    const catalogPath = join(tmpdir(), `wkteam-catalog-${Date.now()}-human-send-async.json`)
+    await writeFile(
+      catalogPath,
+      JSON.stringify({
+        generatedAt: 0,
+        catalog: [
+          { kind: 'endpoint', operationId: 'xiao_xi_fa_song_fa_song_wen_ben_xiao_xi', method: 'POST', path: '/sendText' }
+        ]
+      }),
+      'utf-8'
+    )
+
+    const s = await startTestServer({
+      fetchImpl,
+      configOverrides: {
+        WKTEAM_CATALOG_PATH: catalogPath,
+        UPSTREAM_BASE_URL: 'http://upstream.test',
+        UPSTREAM_AUTHORIZATION: 'Bearer upstream_token',
+        UPSTREAM_AUTH_HEADER_NAME: 'Authorization'
+      }
+    })
+    cleanup = async () => {
+      await s.close()
+      await rm(catalogPath, { force: true })
+    }
+
+    const cid = 'wk:wid_003:u:wxid_peer_789'
+    const created = await fetch(`${s.baseUrl}/api/conversations`, {
+      method: 'POST',
+      headers: { ...s.authHeader, 'content-type': 'application/json' },
+      body: JSON.stringify({ title: 'human send', peerId: 'wxid_peer_789', conversationId: cid })
+    })
+    expect(created.status).toBe(200)
+
+    const t0 = Date.now()
+    const sent = await fetch(`${s.baseUrl}/api/conversations/${encodeURIComponent(cid)}/messages`, {
+      method: 'POST',
+      headers: { ...s.authHeader, 'content-type': 'application/json' },
+      body: JSON.stringify({ kind: 'text', text: 'hello wk human send' })
+    })
+    const t1 = Date.now()
+    const sentText = await sent.text()
+    expect(sent.status, sentText).toBe(200)
+    expect(t1 - t0).toBeLessThan(150)
+
+    await (s as any).drainAutomation()
+
+    expect(calls.length).toBe(1)
+    expect(new URL(calls[0]!.url).pathname).toBe('/sendText')
+    expect(calls[0]!.body).toMatchObject({
+      wId: 'wid_003',
+      wcId: 'wxid_peer_789',
+      content: 'hello wk human send'
     })
   })
 
