@@ -263,10 +263,13 @@ export function SettingsPanel() {
             {runs && runs.length ? (
               <div className={styles.hint} aria-label="automation runs 列表">
                 {runs.map((r) => {
-                  const endedAt = r.endedAt ?? r.startedAt
-                  const costMs = Math.max(0, endedAt - r.startedAt)
+                  const costMs = Math.max(0, r.endedAt - r.startedAt)
                   const statusText =
-                    r.status === 'success' ? 'success' : r.status === 'failed' ? `failed(${r.error?.code ?? 'error'})` : 'running'
+                    r.status === 'success'
+                      ? 'success'
+                      : r.status === 'failed'
+                        ? `failed(${r.error?.code ?? 'error'})`
+                        : `skipped(${r.error?.code ?? 'skipped'})`
                   const cid = r.conversationId
                   const cidShort = cid.length > 40 ? `${cid.slice(0, 40)}…` : cid
                   return (

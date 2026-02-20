@@ -55,9 +55,9 @@ export type BffAutomationRun = {
   conversationId: string
   inputMessageId: string
   outputMessageId: string | null
-  status: 'running' | 'success' | 'failed'
+  status: 'success' | 'failed' | 'skipped'
   startedAt: number
-  endedAt: number | null
+  endedAt: number
   error?: { code: string; message: string }
 }
 

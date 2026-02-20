@@ -17,6 +17,8 @@ export function ChatsPane() {
   const actions = useAppActions()
   const connection = useConnectionState()
   const remote = useRemoteChats(connection.client)
+  const remoteSelectedConversationId = remote.selectedConversationId
+  const remoteSelectConversation = remote.selectConversation
 
   const isServerMode = connection.settings.mode === 'server'
 
@@ -35,8 +37,9 @@ export function ChatsPane() {
   useEffect(() => {
     if (!isServerMode) return
     if (state.persisted.selectedConversationId == null) return
-    remote.selectConversation(state.persisted.selectedConversationId)
-  }, [isServerMode, state.persisted.selectedConversationId, remote])
+    if (remoteSelectedConversationId === state.persisted.selectedConversationId) return
+    remoteSelectConversation(state.persisted.selectedConversationId)
+  }, [isServerMode, remoteSelectConversation, remoteSelectedConversationId, state.persisted.selectedConversationId])
 
   const list = (
     <>
